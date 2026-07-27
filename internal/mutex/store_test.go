@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -274,6 +275,9 @@ func TestForceReleaseUnreadableHolder(t *testing.T) {
 }
 
 func TestHolderFileIsNotWorldReadable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not the access-control model on Windows")
+	}
 	st := newTestStore(t)
 	mustAcquire(t, st, "perm:key", NewToken(), AcquireOpts{TTL: time.Hour, Agent: "a"})
 	fi, err := os.Stat(filepath.Join(st.keyDir("perm:key"), holderFile))

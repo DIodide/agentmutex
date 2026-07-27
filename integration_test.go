@@ -339,18 +339,26 @@ func TestLeaseLossTerminatesRun(t *testing.T) {
 	go func() { done <- cmd.Wait() }()
 
 	time.Sleep(1 * time.Second) // let it acquire and start the child
+	// Simulate a real collision: break the lock and let a *competitor* take
+	// it. The original run's next renew then sees a different holder
+	// (NotHolderError) — the genuine exclusivity violation that must
+	// terminate the run. (A force-release with no competitor is not a
+	// collision and deliberately does not kill the run.)
 	if err := mutexCmd(t, state, "force-release", "--yes", "k").Run(); err != nil {
 		t.Fatalf("force-release: %v", err)
+	}
+	if err := mutexCmd(t, state, "acquire", "--quiet", "--no-wait", "--agent", "thief", "k").Run(); err != nil {
+		t.Fatalf("competitor acquire: %v", err)
 	}
 
 	select {
 	case err := <-done:
 		if code := exitCode(err); code != 14 {
-			t.Fatalf("run after lease loss: exit %d, want 14", code)
+			t.Fatalf("run after lease takeover: exit %d, want 14", code)
 		}
 	case <-time.After(20 * time.Second):
 		cmd.Process.Kill()
-		t.Fatal("run did not terminate after losing its lease")
+		t.Fatal("run did not terminate after losing its lease to a competitor")
 	}
 }
 
@@ -373,6 +381,84 @@ func TestStatusJSONRedactsToken(t *testing.T) {
 	// The token still works, of course.
 	if err := mutexCmd(t, state, "release", "--token", token, "k").Run(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestForceReleaseIdempotent(t *testing.T) {
+	state := t.TempDir()
+	// Never-existed key: force-release --yes is a no-op success, not exit 13.
+	if got := exitCode(mutexCmd(t, state, "force-release", "--yes", "ghost:key").Run()); got != 0 {
+		t.Fatalf("force-release --yes on absent key: exit %d, want 0", got)
+	}
+	// Held → cleared, and a second call is still success.
+	if err := mutexCmd(t, state, "acquire", "--quiet", "k").Run(); err != nil {
+		t.Fatal(err)
+	}
+	if got := exitCode(mutexCmd(t, state, "force-release", "--yes", "k").Run()); got != 0 {
+		t.Fatalf("first force-release: exit %d, want 0", got)
+	}
+	if got := exitCode(mutexCmd(t, state, "force-release", "--yes", "k").Run()); got != 0 {
+		t.Fatalf("idempotent force-release: exit %d, want 0", got)
+	}
+}
+
+func TestTokenFromEnv(t *testing.T) {
+	state := t.TempDir()
+	out, err := mutexCmd(t, state, "acquire", "--quiet", "k").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := strings.TrimSpace(string(out))
+	// release with AGENTMUTEX_TOKEN and no --token flag.
+	cmd := mutexCmd(t, state, "release", "k")
+	cmd.Env = append(cmd.Env, "AGENTMUTEX_TOKEN="+token)
+	if got := exitCode(cmd.Run()); got != 0 {
+		t.Fatalf("release via AGENTMUTEX_TOKEN: exit %d, want 0", got)
+	}
+}
+
+func TestReasonIsSanitized(t *testing.T) {
+	state := t.TempDir()
+	// A reason with a newline + ANSI escape must not survive into output.
+	evil := "ok\n\x1b[31mFAKE-HOLDER: attacker"
+	if err := mutexCmd(t, state, "acquire", "--quiet", "--reason", evil, "k").Run(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := mutexCmd(t, state, "status", "--json", "k").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	// The raw newline and ESC byte must be gone (JSON encodes a real newline
+	// as \n; we assert the literal control bytes are absent).
+	if strings.ContainsRune(s, '\x1b') || strings.Contains(s, "\\u001b") {
+		t.Fatalf("ANSI escape survived sanitization:\n%s", s)
+	}
+	if strings.Contains(s, "\\n") {
+		t.Fatalf("newline survived sanitization into reason:\n%s", s)
+	}
+}
+
+func TestStatusExitCodeExpiredAndCorrupt(t *testing.T) {
+	state := t.TempDir()
+	// Expired → 4.
+	if err := mutexCmd(t, state, "acquire", "--quiet", "--ttl", "200ms", "exp:key").Run(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if got := exitCode(mutexCmd(t, state, "status", "--exit-code", "exp:key").Run()); got != 4 {
+		t.Fatalf("expired: want exit 4, got %d", got)
+	}
+	// Corrupt → 5.
+	if err := mutexCmd(t, state, "acquire", "--quiet", "cor:key").Run(); err != nil {
+		t.Fatal(err)
+	}
+	holder := filepath.Join(state, "locks", "cor%3Akey", "holder.json")
+	if err := os.WriteFile(holder, []byte("{bad"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := exitCode(mutexCmd(t, state, "status", "--exit-code", "cor:key").Run()); got != 5 {
+		t.Fatalf("corrupt: want exit 5, got %d", got)
 	}
 }
 

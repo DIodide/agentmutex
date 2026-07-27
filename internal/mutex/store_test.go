@@ -289,6 +289,54 @@ func TestHolderFileIsNotWorldReadable(t *testing.T) {
 	}
 }
 
+func TestPruneSweepsTempFiles(t *testing.T) {
+	st := newTestStore(t)
+	st.WaiterStaleAfter = 20 * time.Millisecond
+	dir, err := st.ensureKeyDir("swept:key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate crashed-mid-write temp files.
+	holderTmp := filepath.Join(dir, ".holder-12345.tmp")
+	queueTmp := filepath.Join(dir, queueDir, "0001-abc.json.tmp")
+	for _, p := range []string{holderTmp, queueTmp} {
+		if err := os.WriteFile(p, []byte("partial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(40 * time.Millisecond) // age past staleness so queue .tmp is swept
+	if _, err := st.Prune(); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{holderTmp, queueTmp} {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("prune left temp file %s", filepath.Base(p))
+		}
+	}
+}
+
+func TestStatusKeepsHolderWhenQueueUnreadable(t *testing.T) {
+	st := newTestStore(t)
+	mustAcquire(t, st, "held:key", NewToken(), AcquireOpts{TTL: time.Hour, Agent: "a"})
+	// Make the queue dir unreadable by replacing it with a regular file.
+	qdir := filepath.Join(st.keyDir("held:key"), queueDir)
+	if err := os.Remove(qdir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(qdir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ks, err := st.Status("held:key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The holder must survive a queue-read failure (not be mislabeled as
+	// unreadable-with-no-holder).
+	if ks.State != "held" || ks.Holder == nil || ks.Holder.Agent != "a" {
+		t.Fatalf("holder discarded on queue read error: %+v", ks)
+	}
+}
+
 func TestListAndStatus(t *testing.T) {
 	st := newTestStore(t)
 	mustAcquire(t, st, "deploy:staging", NewToken(), AcquireOpts{TTL: time.Hour, Agent: "a", Reason: "ship v2"})

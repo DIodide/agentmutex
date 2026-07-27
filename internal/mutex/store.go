@@ -166,7 +166,10 @@ func Open(root string) (*Store, error) {
 		}
 		root = filepath.Join(home, ".agentmutex")
 	}
-	if err := os.MkdirAll(filepath.Join(root, "locks"), 0o755); err != nil {
+	// 0700 throughout: the lock inventory (decodable key names) and the
+	// tokens in holder documents are per-user and should not be readable by
+	// other local users.
+	if err := os.MkdirAll(filepath.Join(root, "locks"), 0o700); err != nil {
 		return nil, fmt.Errorf("cannot create state directory: %w", err)
 	}
 	return &Store{
@@ -438,7 +441,7 @@ func writeWaiter(path string, w Waiter) error {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o644); err != nil {
+	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
@@ -535,16 +538,16 @@ func (s *Store) statusFromDir(key, dir string) (*KeyStatus, error) {
 	st := &KeyStatus{Key: key, State: "free", Waiters: []Waiter{}}
 	h, err := readHolder(dir)
 	if err != nil {
+		// Both failure modes carry their diagnostic in Error so status/list
+		// can show what is wrong and how to clear it.
 		var corrupt *CorruptError
 		if errors.As(err, &corrupt) {
 			st.State = "corrupt"
 		} else {
 			// An I/O error (permissions, holder.json is a directory, …).
-			// Surface it as a distinct state rather than failing the whole
-			// snapshot, so List can still show the wedged key.
 			st.State = "unreadable"
-			st.Error = err.Error()
 		}
+		st.Error = err.Error()
 	} else if h != nil {
 		st.Holder = h
 		if h.ExpiredAt(now) {
@@ -553,9 +556,17 @@ func (s *Store) statusFromDir(key, dir string) (*KeyStatus, error) {
 			st.State = "held"
 		}
 	}
-	ws, err := s.readQueue(dir, now)
-	if err != nil && st.State != "unreadable" {
-		return nil, err
+	ws, qerr := s.readQueue(dir, now)
+	if qerr != nil {
+		// A failed queue read must not discard an already-read holder (which
+		// would mislabel a held key as unreadable with no holder). Keep what
+		// we have and note the queue problem.
+		if st.State == "free" {
+			st.State = "unreadable"
+		}
+		if st.Error == "" {
+			st.Error = qerr.Error()
+		}
 	}
 	if ws != nil {
 		st.Waiters = ws
@@ -641,6 +652,17 @@ func (s *Store) pruneKey(dir, key string, res *PruneResult) error {
 			res.ExpiredLeases = append(res.ExpiredLeases, key)
 		}
 	}
+	// Sweep orphaned holder temp files (.holder-*.tmp) left by an interrupted
+	// writeHolder. writeHolder only runs under this same guard, so any that
+	// still exist here belong to a crashed prior op and are safe to remove.
+	if dents, derr := os.ReadDir(dir); derr == nil {
+		for _, d := range dents {
+			n := d.Name()
+			if !d.IsDir() && strings.HasPrefix(n, ".holder-") && strings.HasSuffix(n, ".tmp") {
+				os.Remove(filepath.Join(dir, n))
+			}
+		}
+	}
 	qdir := filepath.Join(dir, queueDir)
 	qents, qerr := os.ReadDir(qdir)
 	if qerr != nil {
@@ -649,16 +671,24 @@ func (s *Store) pruneKey(dir, key string, res *PruneResult) error {
 	for _, q := range qents {
 		name := q.Name()
 		path := filepath.Join(qdir, name)
-		// Sweep leftover temp files from an interrupted writeWaiter.
+		fi, ferr := q.Info()
+		if ferr != nil {
+			continue
+		}
+		// Sweep leftover temp files from an interrupted writeWaiter — but
+		// only once they are older than the staleness window. writeWaiter is
+		// guard-free (Enqueue/Heartbeat), so a *fresh* .tmp may be an
+		// in-flight write we must not delete out from under its rename.
 		if strings.HasSuffix(name, ".tmp") {
-			os.Remove(path)
+			if now.Sub(fi.ModTime()) > s.WaiterStaleAfter {
+				os.Remove(path)
+			}
 			continue
 		}
 		if q.IsDir() || !strings.HasSuffix(name, ".json") {
 			continue // only real waiter entries count
 		}
-		fi, ferr := q.Info()
-		if ferr != nil || now.Sub(fi.ModTime()) <= s.WaiterStaleAfter {
+		if now.Sub(fi.ModTime()) <= s.WaiterStaleAfter {
 			continue
 		}
 		// Re-stat immediately before removal: a live waiter may have

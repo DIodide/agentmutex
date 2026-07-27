@@ -67,3 +67,18 @@ order. Contributions welcome — see CONTRIBUTING.md.
 - Use a Job Object to fence the wrapped command's whole process tree on
   lease loss (today only the direct child is terminated on Windows; `run`
   warns). Unix already fences via process groups.
+- The Windows guard's stale-marker reclaim is rename-based but still not fully
+  atomic against a marker recreated between the staleness check and the
+  rename (a narrow window; Unix uses `flock` and is unaffected).
+
+## Known minor gaps
+
+- `run`'s final release can fail if it cannot acquire the per-key guard within
+  the bound; today it warns and lets the lease lapse at its TTL rather than
+  retrying. Acceptable (TTL cleans up), but a bounded retry would be tidier.
+- `signalTree`/`killTree` compute the child's pgid then signal it; a child
+  reaped in that window could, in theory, collide with a reused pgid. The
+  window is closed in practice (we stop signaling once `Wait` returns), but a
+  handle-based API would remove it entirely.
+- No migration of pre-hardening on-disk state: leases created by an older
+  build keep their original 0644/0755 permissions until next rewritten.

@@ -114,6 +114,15 @@ func acquireBlocking(st *mutex.Store, key string, af acquireFlags) (*mutex.Holde
 	if res.Acquired {
 		return res.Holder, ExitOK
 	}
+	// Self-reentry: if we are nested inside an `agentmutex run` that already
+	// holds this exact key (it exported AGENTMUTEX_LEASE_KEY), waiting for it
+	// is a guaranteed self-deadlock — leases are not reentrant. Fail fast
+	// with a clear message instead of blocking forever. (If the ancestor had
+	// already released, the fast path above would have succeeded.)
+	if os.Getenv("AGENTMUTEX_LEASE_KEY") == key {
+		fmt.Fprintf(os.Stderr, "agentmutex: refusing to acquire %s: it is already held by an ancestor 'agentmutex run' (self-deadlock — leases are not reentrant; use a different key or release the parent lease first)\n", key)
+		return nil, ExitHeld
+	}
 	if *af.noWait {
 		fmt.Fprintf(os.Stderr, "agentmutex: %s is %s\n", key, describeBlock(res, st, key, ""))
 		return nil, ExitHeld

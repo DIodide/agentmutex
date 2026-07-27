@@ -6,10 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-A multi-agent adversarial hunt (60 items) drove a second hardening pass. See
+Two multi-agent adversarial hunts (60 + 54 items) drove the hardening. See
 [ROADMAP.md](ROADMAP.md) for the capability backlog that remains.
 
-### Fixed
+### Fixed (second pass — regressions found by the follow-up hunt)
+
+- **`run` no longer kills a command that releases its lease early.** The
+  auto-renew watchdog now distinguishes a *takeover* (someone else holds the
+  key → terminate, exit 14) from the lease simply being gone (child
+  self-released via its exported token, or a bare force-release with no
+  competitor → keep running). It keeps watching, so a later competing acquire
+  is still caught.
+- **`run` no longer hangs interactive commands.** The child is placed in its
+  own process group (for tree-fencing) only when stdin is not a terminal, so
+  commands that read the tty (sudo/ssh prompts, editors, REPLs) no longer
+  stop on SIGTTIN. Signals are delivered to the group only when we created a
+  separate one, never to agentmutex's own group. SIGQUIT is also forwarded.
+- **`force-release --yes` is idempotent** — an already-free (or never-existed)
+  key exits 0, matching the dry-run path, instead of 13.
+- **Self-reentry is detected:** acquiring the same key from inside its own
+  `run` fails fast with a self-deadlock message instead of blocking forever.
+- `prune` sweeps orphaned `.holder-*.tmp` files and only removes queue
+  `.tmp` files older than the staleness window (never an in-flight write).
+- `status`/`list` keep a readable holder even when the queue read fails, and
+  carry the diagnostic for both `corrupt` and `unreadable` states.
+- `sanitizeMeta` also strips C1 controls and Unicode bidi/format characters,
+  and truncates by rune (never splitting a multibyte character).
+- State root and `locks/` are created 0700 (not 0755); queue entries 0600.
+- Docs/skills corrected: queue filename is `<waiter-id>` not `<token>`;
+  exit-code tables include `status --exit-code` (3/4/5) and 128+signal
+  interrupts; `AGENTMUTEX_DIR` export documented; the agent skill no longer
+  mislabels exit 14 as the wrapped command's code; `<command> help` works.
+- CI now also runs the suite under `-race`.
+
+### Fixed (first pass)
 
 - **Lease token no longer leaks through queue entries.** Waiter entries now
   use a public waiter id in their filename and body, distinct from the

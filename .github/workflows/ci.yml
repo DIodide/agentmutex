@@ -25,5 +25,7 @@ jobs:
           test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - name: Test
         run: go test ./... -timeout 5m
+      - name: Test (race)
+        run: go test -race ./... -timeout 10m
       - name: Build
         run: go build .

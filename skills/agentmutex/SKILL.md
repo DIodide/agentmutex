@@ -97,8 +97,10 @@ another agent may have already mutated the resource. Don't blindly retry;
 surface it.
 
 Note: once the wrapped command starts, `run` forwards the command's own exit
-code — so codes 10/11 from `run` only ever mean the lease was never
-acquired, and any other nonzero code came from your command.
+code — with two exceptions. Codes 10/11 from `run` only ever mean the lease
+was never acquired (they can't come from your command, which hadn't started).
+Code 14 is always agentmutex's own "lease lost mid-command" signal, never
+your command's. Any *other* nonzero code came from your command.
 
 ## Don'ts
 

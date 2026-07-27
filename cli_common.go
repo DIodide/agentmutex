@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/DIodide/agentmutex/internal/mutex"
 )
@@ -148,24 +149,33 @@ func validateTimeout(timeout time.Duration) error {
 	return nil
 }
 
-// sanitizeMeta cleans a user-supplied agent/reason string: control
-// characters (newlines, ANSI escapes, NULs) are stripped so they cannot
-// forge status/list lines or drive the terminal, and length is bounded.
+// sanitizeMeta cleans a user-supplied agent/reason string so it cannot forge
+// status/list lines or drive the terminal: C0 and C1 control characters
+// (newlines, ANSI/CSI escapes, NUL) and Unicode format/bidi-override
+// characters (which can visually reorder text) are replaced with a space.
+// Length is bounded by rune count, so truncation never splits a multibyte
+// character.
 func sanitizeMeta(s string) string {
-	const max = 200
+	const maxRunes = 200
 	var b strings.Builder
+	n := 0
 	for _, r := range s {
-		if r == '\t' || (r >= 0x20 && r != 0x7f) {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte(' ')
+		if n >= maxRunes {
+			break
 		}
+		switch {
+		case r == '\t':
+			b.WriteRune(r)
+		case unicode.IsControl(r): // C0 (incl. \n, ESC) and C1 (0x80–0x9F)
+			b.WriteByte(' ')
+		case unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Bidi_Control, r):
+			b.WriteByte(' ') // zero-width / bidi-override formatting chars
+		default:
+			b.WriteRune(r)
+		}
+		n++
 	}
-	out := strings.TrimSpace(b.String())
-	if len(out) > max {
-		out = out[:max]
-	}
-	return out
+	return strings.TrimSpace(b.String())
 }
 
 func printJSON(v any) {

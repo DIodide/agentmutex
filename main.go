@@ -57,7 +57,9 @@ Environment:
 Exit codes:
   0 success   2 usage    10 lock held    11 timed out    12 not lock holder
   13 no lease exists     14 lease lost mid-run           1 other errors
-  (run forwards the wrapped command's exit code; 127 command not found)
+  status --exit-code: 0 held, 3 free, 4 expired, 5 corrupt/unreadable
+  run forwards the wrapped command's exit code; 127 command not found;
+  a signal-interrupted wait exits 128+signum (130 INT, 143 TERM, 129 HUP)
 `
 
 func main() {
@@ -73,6 +75,9 @@ func run(args []string) int {
 	// `help <command>` and `<command> help` both show that command's help.
 	if (cmd == "help" || cmd == "--help" || cmd == "-h") && len(rest) == 1 {
 		return dispatch(rest[0], []string{"-h"})
+	}
+	if len(rest) == 1 && rest[0] == "help" {
+		return dispatch(cmd, []string{"-h"})
 	}
 	return dispatch(cmd, rest)
 }

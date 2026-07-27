@@ -24,16 +24,22 @@ JSON shape (stable):
 ```json
 {
   "key": "deploy:staging",
-  "state": "held",              // "held" | "expired" | "free" | "corrupt"
+  "state": "held",              // "held" | "expired" | "free" | "corrupt" | "unreadable"
   "holder": {
     "agent": "claude-a",
+    "pid": 4213,
+    "host": "ci-runner-7",
     "reason": "deploy v1.2.3",
     "acquired_at": "2026-07-27T20:00:00Z",
     "expires_at": "2026-07-27T20:15:00Z"
   },
-  "waiters": [ { "agent": "claude-b", "fresh": true, "enqueued_at": "..." } ]
+  "waiters": [ { "agent": "claude-b", "fresh": true, "enqueued_at": "..." } ],
+  "error": ""                   // populated only when state is corrupt/unreadable
 }
 ```
+
+The holder's `pid`/`host` are what you check before force-releasing (see
+below); the lease `token` is redacted from `status`/`list` output.
 
 For scripting, `agentmutex status --exit-code <key>` maps state to an exit
 code (0 held, 3 free, 4 expired, 5 corrupt/unreadable) so you can branch
@@ -70,7 +76,10 @@ per second (the built-in poll) or even once per minute between your other
 actions is plenty. A cheap pattern inside an agent loop:
 
 ```bash
-state=$(agentmutex status --json deploy:staging | grep -o '"state": "[a-z]*"')
+# Cleanest: let the CLI do the branching (no parsing).
+agentmutex status --exit-code deploy:staging; case $? in 0) echo held;; 3) echo free;; 4) echo expired;; esac
+# Or extract just the state value:
+state=$(agentmutex status --json deploy:staging | sed -n 's/.*"state": "\([a-z]*\)".*/\1/p')
 ```
 
 …do other useful work, and check again on your next turn rather than burning

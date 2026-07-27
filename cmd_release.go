@@ -118,6 +118,12 @@ func cmdForceRelease(args []string) int {
 	}
 	h, err := st.Release(key, "", true)
 	if err != nil {
+		// Idempotent: if the key is already free, the desired end state holds
+		// — matches the dry-run branch, so a retry/loop doesn't exit nonzero.
+		if errors.Is(err, mutex.ErrNotHeld) {
+			fmt.Fprintf(os.Stderr, "agentmutex: %s is already free; nothing to do\n", key)
+			return ExitOK
+		}
 		return releaseErrCode(err)
 	}
 	if h != nil {

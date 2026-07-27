@@ -89,7 +89,7 @@ acquire:                       release:                renew:
 `acquire` without `--no-wait` is Strategy A (pessimistic orchestration):
 
 1. Try once. If the key is free and no fresh waiter is ahead, done.
-2. Otherwise **enqueue**: create `queue/<arrival-nanos>-<token>.json`.
+2. Otherwise **enqueue**: create `queue/<arrival-nanos>-<waiter-id>.json`.
    Creating a uniquely-named file is atomic; no guard needed.
 3. Poll every `--poll` (default 1s, jittered +0–25% so waiters don't march
    in lockstep; bounded to 10ms–10s so heartbeats always outpace the
@@ -113,7 +113,9 @@ renew occasionally). Each liveness signal matches its role's natural cadence.
 | Who dies | What happens |
 |---|---|
 | Holder, mid-work | Lease expires at TTL; next fresh queue head displaces it. `run` auto-renews at TTL/3 (which is why `run` requires `--ttl ≥ 5s`), so only SIGKILL of the wrapper leads here. |
-| Holder doesn't die but *loses the lease* (host suspended past TTL, a human force-release, or renewals failing past the TTL) | `run` detects it on the next renew: by default it terminates the command's whole process group (SIGTERM, then SIGKILL after 10s) and exits 14, because continuing would mutate concurrently with the new holder. `--on-lease-loss continue` opts out. On Unix the child runs in its own process group so backgrounded grandchildren are fenced too; on Windows only the direct child is terminated (`run` warns). |
+| Holder *loses the lease to a competitor* (host suspended past TTL and a waiter takes over, or a human force-release followed by another agent acquiring) | `run` detects it on the next renew (the new holder's token differs). By default it terminates the command's whole process group (SIGTERM, then SIGKILL after 10s) and exits 14, because continuing would mutate concurrently with the new holder. `--on-lease-loss continue` opts out. On Unix a non-interactive child runs in its own process group so backgrounded grandchildren are fenced too; interactive children and Windows fence only the direct child (`run` warns). |
+| Lease *cleared with no competitor* (the wrapped command released early via its exported token, or a bare force-release nobody re-acquired) | Not a collision — `run` keeps the command running and does not exit 14. It keeps watching, so a *later* competing acquire is still caught and terminates the run. |
+| Renewals *fail past the TTL* (I/O error, ENOSPC, damaged holder file) | Treated as loss once the failures outlast the lease: `run` terminates and exits 14. |
 | Waiter, mid-wait | Its queue entry goes stale in 30s and is skipped/pruned. |
 | CLI, holding the guard | Kernel releases the flock at process exit. (Windows fallback: 60s staleness reclaim.) |
 | CLI, mid-write of holder.json | The temp file is orphaned; the rename never happened, so state is unchanged. |

@@ -142,9 +142,10 @@ lost mid-command — default `terminate`). `status` takes `--exit-code` for
 scripting (0 held, 3 free, 4 expired, 5 corrupt/unreadable) and `wait` takes
 `--json`. Flags go before positional arguments. Aliases: `lock`/`unlock`/`ls`.
 
-Inside `run`, the wrapped command inherits `AGENTMUTEX_LEASE_KEY` and
-`AGENTMUTEX_TOKEN` for the held lease, so a script can renew or release early
-and a nested `agentmutex` call can tell it is re-entering the same key.
+Inside `run`, the wrapped command inherits `AGENTMUTEX_LEASE_KEY`,
+`AGENTMUTEX_TOKEN`, and `AGENTMUTEX_DIR` for the held lease, so a script can
+renew or release early, and a nested `agentmutex acquire`/`run` on the *same*
+key fails fast with a self-deadlock message instead of blocking forever.
 
 ### Exit codes
 
@@ -161,11 +162,15 @@ Stable — agents branch on these:
 | `14` | `run`: lease lost while the command was executing (resource may have been mutated concurrently) |
 | `1` | Other errors |
 
+`status --exit-code <key>` instead maps state to an exit code for scripting:
+`0` held, `3` free, `4` expired, `5` corrupt/unreadable.
+
 Additionally: `run` **forwards the wrapped command's exit code** once the
 command has started (so a child that exits 10 is indistinguishable from
 "lock held" by code alone — codes 10/11 from `run` can only occur *before*
-the command starts); `127` means the command could not be started; `130`/
-`143` mean interrupted by SIGINT/SIGTERM.
+the command starts); `127` means the command could not be started; a wait
+interrupted by a signal exits `128+signum` (`130` SIGINT, `143` SIGTERM,
+`129` SIGHUP).
 
 ### Environment
 
@@ -184,7 +189,7 @@ State is plain JSON you can inspect with `cat` — see
 ~/.agentmutex/locks/<encoded-key>/
 ├── guard         # per-key flock target (empty)
 ├── holder.json   # current lease: token, agent, reason, acquired_at, expires_at
-└── queue/        # FIFO waiters: <arrival-nanos>-<token>.json (mtime = heartbeat)
+└── queue/        # FIFO waiters: <arrival-nanos>-<waiter-id>.json (mtime = heartbeat)
 ```
 
 Reading the files directly is supported (that's how you monitor). **Writing

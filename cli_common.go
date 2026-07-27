@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/DIodide/agentmutex/internal/mutex"
@@ -84,24 +86,22 @@ func oneKeyArg(fs *flag.FlagSet) (string, error) {
 	return key, nil
 }
 
-// redactTokens strips lease tokens from a status snapshot before display.
-// The token authorizes release/renew; status must inform other agents, not
-// hand them the holder's credential to misuse.
+// redactTokens strips the holder's lease token from a status snapshot before
+// display. The token authorizes release/renew; status must inform other
+// agents, not hand them the holder's credential to misuse. (Waiter entries
+// carry only a public ID, never the token.)
 func redactTokens(ks *mutex.KeyStatus) *mutex.KeyStatus {
 	if ks.Holder != nil {
 		h := *ks.Holder
 		h.Token = ""
 		ks.Holder = &h
 	}
-	for i := range ks.Waiters {
-		ks.Waiters[i].Token = ""
-	}
 	return ks
 }
 
 // defaultAgent names this agent: $AGENTMUTEX_AGENT, else user@host.
 func defaultAgent() string {
-	if a := os.Getenv("AGENTMUTEX_AGENT"); a != "" {
+	if a := sanitizeMeta(os.Getenv("AGENTMUTEX_AGENT")); a != "" {
 		return a
 	}
 	name := "unknown"
@@ -115,6 +115,10 @@ func defaultAgent() string {
 	return name + "@" + host
 }
 
+// errNoToken is returned by tokenOrEnv when no token is available; callers
+// map it to the usage exit code (a missing token is a caller mistake).
+var errNoToken = errors.New("no token: pass --token or set AGENTMUTEX_TOKEN")
+
 // tokenOrEnv resolves the lease token: --token flag, else $AGENTMUTEX_TOKEN.
 func tokenOrEnv(token string) (string, error) {
 	if token != "" {
@@ -123,7 +127,45 @@ func tokenOrEnv(token string) (string, error) {
 	if t := os.Getenv("AGENTMUTEX_TOKEN"); t != "" {
 		return t, nil
 	}
-	return "", fmt.Errorf("no token: pass --token or set AGENTMUTEX_TOKEN")
+	return "", errNoToken
+}
+
+// signalExit maps an interrupting signal to the conventional 128+N exit code
+// (130 for SIGINT, 143 for SIGTERM), falling back to 130.
+func signalExit(s os.Signal) int {
+	if ssig, ok := s.(syscall.Signal); ok {
+		return 128 + int(ssig)
+	}
+	return 130
+}
+
+// validateTimeout rejects a negative wait timeout, which would otherwise be
+// silently indistinguishable from 0 ("wait forever").
+func validateTimeout(timeout time.Duration) error {
+	if timeout < 0 {
+		return fmt.Errorf("--timeout must be >= 0 (0 means wait forever), got %s", timeout)
+	}
+	return nil
+}
+
+// sanitizeMeta cleans a user-supplied agent/reason string: control
+// characters (newlines, ANSI escapes, NULs) are stripped so they cannot
+// forge status/list lines or drive the terminal, and length is bounded.
+func sanitizeMeta(s string) string {
+	const max = 200
+	var b strings.Builder
+	for _, r := range s {
+		if r == '\t' || (r >= 0x20 && r != 0x7f) {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte(' ')
+		}
+	}
+	out := strings.TrimSpace(b.String())
+	if len(out) > max {
+		out = out[:max]
+	}
+	return out
 }
 
 func printJSON(v any) {
@@ -152,8 +194,9 @@ func humanDur(d time.Duration) string {
 	return d.String()
 }
 
-// describeBlock explains why an acquire attempt did not succeed.
-func describeBlock(res *mutex.AcquireResult, st *mutex.Store, key, token string) string {
+// describeBlock explains why an acquire attempt did not succeed. id is our
+// own waiter ID ("" if we are not queued yet).
+func describeBlock(res *mutex.AcquireResult, st *mutex.Store, key, id string) string {
 	if res.Holder != nil {
 		now := time.Now()
 		msg := fmt.Sprintf("held by %s", res.Holder.Agent)
@@ -161,13 +204,13 @@ func describeBlock(res *mutex.AcquireResult, st *mutex.Store, key, token string)
 			msg += fmt.Sprintf(" (%s)", res.Holder.Reason)
 		}
 		msg += fmt.Sprintf(", expires in %s", humanDur(res.Holder.ExpiresAt.Sub(now)))
-		if n := waitersAhead(st, key, token); n > 0 {
+		if n := waitersAhead(st, key, id); n > 0 {
 			msg += fmt.Sprintf(", %d waiter(s) ahead", n)
 		}
 		return msg
 	}
 	if res.Blocker != nil {
-		n := waitersAhead(st, key, token)
+		n := waitersAhead(st, key, id)
 		if n <= 0 {
 			n = 1
 		}
@@ -176,9 +219,9 @@ func describeBlock(res *mutex.AcquireResult, st *mutex.Store, key, token string)
 	return "unavailable"
 }
 
-// waitersAhead counts fresh waiters queued before token (all of them if we
-// are not in the queue).
-func waitersAhead(st *mutex.Store, key, token string) int {
+// waitersAhead counts fresh waiters queued before our entry (all of them if
+// we are not in the queue).
+func waitersAhead(st *mutex.Store, key, id string) int {
 	ks, err := st.Status(key)
 	if err != nil {
 		return 0
@@ -188,7 +231,7 @@ func waitersAhead(st *mutex.Store, key, token string) int {
 		if !w.Fresh {
 			continue
 		}
-		if w.Token == token {
+		if id != "" && w.ID == id {
 			return n
 		}
 		n++

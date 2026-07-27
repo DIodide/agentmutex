@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -84,7 +85,7 @@ func cmdRun(args []string) int {
 	// lease held (it would strand the lease until TTL expiry). Buffered
 	// signals are forwarded to the child as soon as it starts.
 	sigc := make(chan os.Signal, 4)
-	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigc)
 
 	holder, code := acquireBlocking(st, key, af)
@@ -94,7 +95,18 @@ func cmdRun(args []string) int {
 	if !*af.quiet {
 		fmt.Fprintf(os.Stderr, "agentmutex: holding %s (ttl %s, auto-renewing) — running: %s\n",
 			key, humanDur(*af.ttl), shellJoin(cmdArgs))
+		if *onLoss == "terminate" && !fencesProcessTree {
+			fmt.Fprintf(os.Stderr, "agentmutex: note: on this platform only the direct child is terminated on lease loss; detached grandchildren are not fenced\n")
+		}
 	}
+
+	// Child inherits the lease so wrapped scripts can renew/release early and
+	// nested agentmutex calls can detect self-reentry instead of deadlocking.
+	childEnv := append(os.Environ(),
+		"AGENTMUTEX_LEASE_KEY="+key,
+		"AGENTMUTEX_TOKEN="+holder.Token,
+		"AGENTMUTEX_DIR="+st.Root,
+	)
 
 	// Auto-renew at ttl/3 so even two consecutive missed renewals cannot
 	// lose the lease while the command runs. Definitive loss (someone else
@@ -112,16 +124,27 @@ func cmdRun(args []string) int {
 		}
 		t := time.NewTicker(interval)
 		defer t.Stop()
+		// lastGood tracks the most recent moment the lease was provably ours.
+		// If renews keep failing (I/O error, ENOSPC, holder.json damaged)
+		// past the point our lease must have expired, the lease is gone even
+		// though we never saw an explicit NotHolder — treat that as loss too.
+		lastGood := holder.ExpiresAt
 		for {
 			select {
 			case <-t.C:
-				_, err := st.Renew(key, holder.Token, *af.ttl)
+				h, err := st.Renew(key, holder.Token, *af.ttl)
 				if err == nil {
+					lastGood = h.ExpiresAt
 					continue
 				}
 				var nh *mutex.NotHolderError
 				if errors.Is(err, mutex.ErrNotHeld) || errors.As(err, &nh) {
 					fmt.Fprintf(os.Stderr, "agentmutex: LEASE LOST on %s: %v\n", key, err)
+					lostOnce.Do(func() { close(leaseLost) })
+					return
+				}
+				if !time.Now().Before(lastGood) {
+					fmt.Fprintf(os.Stderr, "agentmutex: LEASE LOST on %s: renewals have been failing past the TTL (%v); assuming the lease expired\n", key, err)
 					lostOnce.Do(func() { close(leaseLost) })
 					return
 				}
@@ -132,7 +155,7 @@ func cmdRun(args []string) int {
 		}
 	}()
 
-	code = runChild(cmdArgs, sigc, leaseLost, *onLoss == "terminate")
+	code = runChild(cmdArgs, childEnv, sigc, leaseLost, *onLoss == "terminate")
 
 	close(stopRenew)
 	<-renewDone
@@ -144,11 +167,18 @@ func cmdRun(args []string) int {
 	default:
 	}
 	if _, err := st.Release(key, holder.Token, false); err != nil {
+		// NotHolderError means someone else holds the lease now — a genuine
+		// collision. ErrNotHeld only means the lease is already gone (it
+		// expired, or the wrapped command released early via the exported
+		// token); since the command has already finished, that is not a
+		// collision, so don't escalate it to exit 14.
 		var nh *mutex.NotHolderError
-		if errors.Is(err, mutex.ErrNotHeld) || errors.As(err, &nh) {
+		if errors.As(err, &nh) {
 			lost = true
 		}
-		fmt.Fprintf(os.Stderr, "agentmutex: warning: failed to release %s: %v\n", key, err)
+		if !errors.Is(err, mutex.ErrNotHeld) || !*af.quiet {
+			fmt.Fprintf(os.Stderr, "agentmutex: warning: failed to release %s: %v\n", key, err)
+		}
 	} else if !*af.quiet {
 		fmt.Fprintf(os.Stderr, "agentmutex: released %s\n", key)
 	}
@@ -163,14 +193,17 @@ func cmdRun(args []string) int {
 }
 
 // runChild runs the command with stdio passed through, forwarding signals
-// from sigc, and returns its exit code. If leaseLost closes and
-// terminateOnLoss is set, the child gets SIGTERM, then SIGKILL after a
-// grace period.
-func runChild(argv []string, sigc chan os.Signal, leaseLost <-chan struct{}, terminateOnLoss bool) int {
+// from sigc to the child's whole process tree, and returns its exit code. If
+// leaseLost closes and terminateOnLoss is set, the tree gets SIGTERM, then
+// SIGKILL after a grace period — so backgrounded grandchildren cannot keep
+// mutating the resource once the lease is gone.
+func runChild(argv []string, env []string, sigc chan os.Signal, leaseLost <-chan struct{}, terminateOnLoss bool) int {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Env = env
+	setChildProcGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "agentmutex: %v\n", err)
 		return 127
@@ -180,16 +213,16 @@ func runChild(argv []string, sigc chan os.Signal, leaseLost <-chan struct{}, ter
 		for {
 			select {
 			case s := <-sigc:
-				cmd.Process.Signal(s)
+				signalTree(cmd, s)
 			case <-leaseLost:
 				leaseLost = nil // closed channel would spin this loop
 				if terminateOnLoss {
 					fmt.Fprintf(os.Stderr, "agentmutex: terminating command (lease lost); SIGKILL in %s\n", humanDur(leaseLossGrace))
-					cmd.Process.Signal(syscall.SIGTERM)
+					signalTree(cmd, syscall.SIGTERM)
 					go func() {
 						select {
 						case <-time.After(leaseLossGrace):
-							cmd.Process.Kill()
+							killTree(cmd)
 						case <-waitDone:
 						}
 					}()
@@ -218,13 +251,22 @@ func runChild(argv []string, sigc chan os.Signal, leaseLost <-chan struct{}, ter
 	return ExitError
 }
 
+// shellJoin renders argv for the human-readable "running:" banner, quoting
+// any argument that contains whitespace or shell-significant characters so
+// the displayed command is unambiguous (and copy-pasteable).
 func shellJoin(argv []string) string {
-	out := ""
+	var b strings.Builder
 	for i, a := range argv {
 		if i > 0 {
-			out += " "
+			b.WriteByte(' ')
 		}
-		out += a
+		if a == "" || strings.ContainsAny(a, " \t\n\"'\\$`*?()|&;<>") {
+			b.WriteByte('\'')
+			b.WriteString(strings.ReplaceAll(a, "'", `'\''`))
+			b.WriteByte('\'')
+		} else {
+			b.WriteString(a)
+		}
 	}
-	return out
+	return b.String()
 }

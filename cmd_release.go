@@ -25,7 +25,8 @@ func cmdRelease(args []string) int {
 	}
 	tok, err := tokenOrEnv(*token)
 	if err != nil {
-		return fail(err)
+		fmt.Fprintf(os.Stderr, "agentmutex: %v\n", err)
+		return ExitUsage
 	}
 	st, err := openStore(*dir)
 	if err != nil {
@@ -54,9 +55,14 @@ func cmdRenew(args []string) int {
 		fs.Usage()
 		return ExitUsage
 	}
+	if err := validateTTL(*ttl); err != nil {
+		fmt.Fprintf(os.Stderr, "agentmutex: %v\n", err)
+		return ExitUsage
+	}
 	tok, err := tokenOrEnv(*token)
 	if err != nil {
-		return fail(err)
+		fmt.Fprintf(os.Stderr, "agentmutex: %v\n", err)
+		return ExitUsage
 	}
 	st, err := openStore(*dir)
 	if err != nil {
@@ -99,8 +105,9 @@ func cmdForceRelease(args []string) int {
 			return fail(err)
 		}
 		if ks.State == "free" {
+			// Idempotent: the desired end state (no lease) already holds.
 			fmt.Fprintf(os.Stderr, "agentmutex: %s is already free; nothing to do\n", key)
-			return ExitNotHeld
+			return ExitOK
 		}
 		fmt.Fprintf(os.Stderr, "agentmutex: would force-release %s (state %s", key, ks.State)
 		if ks.Holder != nil {

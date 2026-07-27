@@ -9,11 +9,13 @@
 // Every mutation (acquire, release, renew, prune) runs while holding the
 // per-key guard, so read-modify-write sequences are serialized across
 // processes without any daemon. holder.json is replaced via temp-file +
-// rename, so guard-free readers (status, list) always see a complete
-// document.
+// rename (mode 0600, under a 0700 tree), so guard-free readers (status,
+// list) always see a complete document and the lease token is not
+// world-readable.
 //
-// Waiter entries are named "<zero-padded-unixnano>-<token>.json", so
-// lexicographic order is arrival order. A waiter proves it is alive by
+// Waiter entries are named "<zero-padded-unixnano>-<id>.json", so
+// lexicographic order is arrival order. The id is a public queue identity,
+// distinct from the private lease token. A waiter proves it is alive by
 // touching its entry's mtime on every poll; entries whose mtime is older
 // than WaiterStaleAfter belong to dead waiters and are skipped.
 package mutex
@@ -83,25 +85,35 @@ type Holder struct {
 func (h *Holder) ExpiredAt(now time.Time) bool { return !now.Before(h.ExpiresAt) }
 
 // Waiter is a queued acquire attempt.
+//
+// ID is a public queue identity, deliberately distinct from the private
+// lease token: a waiter's entry (name and body) is visible to any local
+// process, so putting the lease token here would hand out the credential
+// that release/renew require. FIFO ordering keys on ID, never on the token.
 type Waiter struct {
-	Token      string    `json:"token,omitempty"`
+	ID         string    `json:"id"`
 	Agent      string    `json:"agent"`
 	PID        int       `json:"pid"`
 	Host       string    `json:"host"`
 	Reason     string    `json:"reason,omitempty"`
 	EnqueuedAt time.Time `json:"enqueued_at"`
 
-	// Computed on read, not stored.
+	// Fresh and LastSeen are computed from the entry's mtime on read; the
+	// on-disk "fresh" field is written true and ignored when reading.
 	Fresh    bool      `json:"fresh"`
 	LastSeen time.Time `json:"last_seen,omitzero"`
 }
 
 // KeyStatus is a read-only snapshot of one key.
 type KeyStatus struct {
-	Key     string   `json:"key"`
-	State   string   `json:"state"` // "held", "expired" or "free"
+	Key string `json:"key"`
+	// State is "held", "expired", "free", "corrupt" (holder.json is
+	// unparseable) or "unreadable" (an I/O error prevented reading it).
+	State   string   `json:"state"`
 	Holder  *Holder  `json:"holder,omitempty"`
 	Waiters []Waiter `json:"waiters"`
+	// Error carries the underlying message when State is "unreadable".
+	Error string `json:"error,omitempty"`
 }
 
 // AcquireOpts parameterizes TryAcquire.
@@ -111,8 +123,12 @@ type AcquireOpts struct {
 	PID    int
 	Host   string
 	Reason string
-	// Enqueued indicates the token has a queue entry that should be
-	// removed if the acquire succeeds.
+	// WaiterID is this caller's queue identity (see Waiter.ID). When set,
+	// FIFO fairness lets us take the lease only if we are the fresh queue
+	// head, and our queue entry is removed on success.
+	WaiterID string
+	// Enqueued indicates we have a queue entry that should be removed if
+	// the acquire succeeds.
 	Enqueued bool
 }
 
@@ -165,17 +181,37 @@ func (s *Store) keyDir(key string) string { return filepath.Join(s.locksDir(), E
 
 func (s *Store) ensureKeyDir(key string) (string, error) {
 	dir := s.keyDir(key)
-	if err := os.MkdirAll(filepath.Join(dir, queueDir), 0o755); err != nil {
+	// 0700: lease state (including tokens in holder.json) is per-user; keep
+	// other UIDs out. Same-UID processes are a trust boundary either way.
+	if err := os.MkdirAll(filepath.Join(dir, queueDir), 0o700); err != nil {
 		return "", fmt.Errorf("cannot create lock directory: %w", err)
 	}
 	return dir, nil
 }
 
-// withGuard runs fn while holding the per-key mutation guard.
+// withGuard runs fn while holding the per-key mutation guard, creating the
+// key directory if needed (used by acquire/enqueue/prune).
 func (s *Store) withGuard(key string, fn func(dir string) error) error {
 	dir, err := s.ensureKeyDir(key)
 	if err != nil {
 		return err
+	}
+	release, err := lockGuard(filepath.Join(dir, guardFile))
+	if err != nil {
+		return err
+	}
+	defer release()
+	return fn(dir)
+}
+
+// withExistingGuard is like withGuard but does NOT create the key directory:
+// if it does not exist, notThere is returned instead. Release and Renew use
+// this so a mistaken `release nonexistent:key` cannot litter the store with
+// empty phantom lock directories that List would then show forever.
+func (s *Store) withExistingGuard(key string, notThere error, fn func(dir string) error) error {
+	dir := s.keyDir(key)
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		return notThere
 	}
 	release, err := lockGuard(filepath.Join(dir, guardFile))
 	if err != nil {
@@ -206,13 +242,29 @@ func writeHolder(dir string, h *Holder) error {
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(dir, fmt.Sprintf(".holder-%d.tmp", os.Getpid()))
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o644); err != nil {
+	// os.CreateTemp makes an O_EXCL file with a random name at mode 0600:
+	// no predictable path to pre-plant as a symlink, and the token-bearing
+	// document is never world-readable. The rename is atomic, so guard-free
+	// readers see either the old or the new document, never a torn one.
+	f, err := os.CreateTemp(dir, ".holder-*.tmp")
+	if err != nil {
 		return err
 	}
-	// Atomic replace: guard-free readers see either the old or the new
-	// document, never a torn one.
-	return os.Rename(tmp, filepath.Join(dir, holderFile))
+	tmp := f.Name()
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, filepath.Join(dir, holderFile)); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // TryAcquire makes one attempt to take the lease. It never blocks (beyond
@@ -237,12 +289,13 @@ func (s *Store) TryAcquire(key, token string, o AcquireOpts) (*AcquireResult, er
 			return nil // held by someone (possibly us — re-entry is not supported)
 		}
 		// Key is free (or the lease expired and can be displaced).
-		// FIFO fairness: only the fresh queue head may take it.
+		// FIFO fairness: only the fresh queue head may take it. Identity is
+		// the public WaiterID, never the private lease token.
 		head, err := s.queueHead(dir, now)
 		if err != nil {
 			return err
 		}
-		if head != nil && head.Token != token {
+		if head != nil && head.ID != o.WaiterID {
 			res.Blocker = head
 			return nil
 		}
@@ -260,7 +313,7 @@ func (s *Store) TryAcquire(key, token string, o AcquireOpts) (*AcquireResult, er
 			return err
 		}
 		if o.Enqueued {
-			s.removeQueueEntry(dir, token)
+			s.removeQueueEntry(dir, o.WaiterID)
 		}
 		res.Acquired = true
 		res.Holder = nh
@@ -280,19 +333,28 @@ func (s *Store) Release(key, token string, force bool) (*Holder, error) {
 		return nil, err
 	}
 	var released *Holder
-	err := s.withGuard(key, func(dir string) error {
-		h, err := readHolder(dir)
-		var corrupt *CorruptError
-		if errors.As(err, &corrupt) && force {
-			return os.Remove(filepath.Join(dir, holderFile))
+	err := s.withExistingGuard(key, ErrNotHeld, func(dir string) error {
+		if force {
+			// The human override must always win: never block on being able
+			// to *read* the document we are about to delete. RemoveAll also
+			// clears a holder.json that was replaced by a directory.
+			holder := filepath.Join(dir, holderFile)
+			if _, statErr := os.Stat(holder); errors.Is(statErr, os.ErrNotExist) {
+				return ErrNotHeld
+			}
+			if h, rerr := readHolder(dir); rerr == nil {
+				released = h // best-effort: report who we displaced
+			}
+			return os.RemoveAll(holder)
 		}
+		h, err := readHolder(dir)
 		if err != nil {
 			return err
 		}
 		if h == nil {
 			return ErrNotHeld
 		}
-		if !force && h.Token != token {
+		if h.Token != token {
 			return &NotHolderError{Holder: h}
 		}
 		released = h
@@ -315,7 +377,7 @@ func (s *Store) Renew(key, token string, ttl time.Duration) (*Holder, error) {
 		ttl = DefaultTTL
 	}
 	var renewed *Holder
-	err := s.withGuard(key, func(dir string) error {
+	err := s.withExistingGuard(key, ErrNotHeld, func(dir string) error {
 		h, err := readHolder(dir)
 		if err != nil {
 			return err
@@ -352,10 +414,13 @@ func (s *Store) Enqueue(key string, w Waiter) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if w.ID == "" {
+		return "", fmt.Errorf("waiter ID must be set")
+	}
 	if w.EnqueuedAt.IsZero() {
 		w.EnqueuedAt = s.now()
 	}
-	name := fmt.Sprintf("%020d-%s.json", w.EnqueuedAt.UnixNano(), w.Token)
+	name := fmt.Sprintf("%020d-%s.json", w.EnqueuedAt.UnixNano(), w.ID)
 	path := filepath.Join(dir, queueDir, name)
 	if err := writeWaiter(path, w); err != nil {
 		return "", err
@@ -471,10 +536,15 @@ func (s *Store) statusFromDir(key, dir string) (*KeyStatus, error) {
 	h, err := readHolder(dir)
 	if err != nil {
 		var corrupt *CorruptError
-		if !errors.As(err, &corrupt) {
-			return nil, err
+		if errors.As(err, &corrupt) {
+			st.State = "corrupt"
+		} else {
+			// An I/O error (permissions, holder.json is a directory, …).
+			// Surface it as a distinct state rather than failing the whole
+			// snapshot, so List can still show the wedged key.
+			st.State = "unreadable"
+			st.Error = err.Error()
 		}
-		st.State = "corrupt"
 	} else if h != nil {
 		st.Holder = h
 		if h.ExpiredAt(now) {
@@ -484,7 +554,7 @@ func (s *Store) statusFromDir(key, dir string) (*KeyStatus, error) {
 		}
 	}
 	ws, err := s.readQueue(dir, now)
-	if err != nil {
+	if err != nil && st.State != "unreadable" {
 		return nil, err
 	}
 	if ws != nil {
@@ -494,6 +564,8 @@ func (s *Store) statusFromDir(key, dir string) (*KeyStatus, error) {
 }
 
 // List returns snapshots of every key the store knows about, sorted by key.
+// Keys whose state cannot be read are still reported (State "unreadable")
+// rather than dropped, so a wedged lock never looks like it does not exist.
 func (s *Store) List() ([]KeyStatus, error) {
 	entries, err := os.ReadDir(s.locksDir())
 	if err != nil {
@@ -510,6 +582,7 @@ func (s *Store) List() ([]KeyStatus, error) {
 		}
 		st, err := s.statusFromDir(key, filepath.Join(s.locksDir(), e.Name()))
 		if err != nil {
+			out = append(out, KeyStatus{Key: key, State: "unreadable", Waiters: []Waiter{}, Error: err.Error()})
 			continue
 		}
 		out = append(out, *st)
@@ -522,11 +595,14 @@ func (s *Store) List() ([]KeyStatus, error) {
 type PruneResult struct {
 	ExpiredLeases []string `json:"expired_leases"`
 	StaleWaiters  int      `json:"stale_waiters"`
+	// Errors holds per-key failures; Prune keeps going past them so one
+	// wedged key cannot hide cleanup of all the others.
+	Errors []string `json:"errors,omitempty"`
 }
 
-// Prune removes expired leases and stale waiter entries. It never removes
-// lock directories: an open guard file descriptor in another process must
-// stay valid, and empty directories are free.
+// Prune removes expired leases, stale waiter entries and orphaned temp
+// files. It never removes lock directories: an open guard file descriptor in
+// another process must stay valid, and empty directories are free.
 func (s *Store) Prune() (*PruneResult, error) {
 	entries, err := os.ReadDir(s.locksDir())
 	if err != nil {
@@ -541,54 +617,70 @@ func (s *Store) Prune() (*PruneResult, error) {
 		if err != nil {
 			continue
 		}
-		err = s.withGuard(key, func(dir string) error {
-			now := s.now()
-			h, herr := readHolder(dir)
-			if herr == nil && h != nil && h.ExpiredAt(now) {
-				if os.Remove(filepath.Join(dir, holderFile)) == nil {
-					res.ExpiredLeases = append(res.ExpiredLeases, key)
-				}
-			}
-			qdir := filepath.Join(dir, queueDir)
-			qents, qerr := os.ReadDir(qdir)
-			if qerr != nil {
-				return nil
-			}
-			for _, q := range qents {
-				fi, ferr := q.Info()
-				if ferr != nil {
-					continue
-				}
-				if now.Sub(fi.ModTime()) <= s.WaiterStaleAfter {
-					continue
-				}
-				// Re-stat immediately before removal: a live waiter may
-				// have heartbeated between ReadDir and here (Heartbeat
-				// deliberately takes no guard).
-				path := filepath.Join(qdir, q.Name())
-				if fi2, serr := os.Stat(path); serr == nil && now.Sub(fi2.ModTime()) > s.WaiterStaleAfter {
-					if os.Remove(path) == nil {
-						res.StaleWaiters++
-					}
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			return nil, err
+		// Guard the actual on-disk directory by its own name; re-encoding
+		// the decoded key could point at a *different* directory for any
+		// non-canonical name.
+		dir := filepath.Join(s.locksDir(), e.Name())
+		if perr := s.pruneKey(dir, key, res); perr != nil {
+			res.Errors = append(res.Errors, fmt.Sprintf("%s: %v", key, perr))
 		}
 	}
 	return res, nil
 }
 
-// removeQueueEntry deletes any queue entry for token. Caller holds the guard.
-func (s *Store) removeQueueEntry(dir, token string) {
+func (s *Store) pruneKey(dir, key string, res *PruneResult) error {
+	release, err := lockGuard(filepath.Join(dir, guardFile))
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	now := s.now()
+	if h, herr := readHolder(dir); herr == nil && h != nil && h.ExpiredAt(now) {
+		if os.Remove(filepath.Join(dir, holderFile)) == nil {
+			res.ExpiredLeases = append(res.ExpiredLeases, key)
+		}
+	}
+	qdir := filepath.Join(dir, queueDir)
+	qents, qerr := os.ReadDir(qdir)
+	if qerr != nil {
+		return nil
+	}
+	for _, q := range qents {
+		name := q.Name()
+		path := filepath.Join(qdir, name)
+		// Sweep leftover temp files from an interrupted writeWaiter.
+		if strings.HasSuffix(name, ".tmp") {
+			os.Remove(path)
+			continue
+		}
+		if q.IsDir() || !strings.HasSuffix(name, ".json") {
+			continue // only real waiter entries count
+		}
+		fi, ferr := q.Info()
+		if ferr != nil || now.Sub(fi.ModTime()) <= s.WaiterStaleAfter {
+			continue
+		}
+		// Re-stat immediately before removal: a live waiter may have
+		// heartbeated between ReadDir and here (Heartbeat takes no guard).
+		if fi2, serr := os.Stat(path); serr == nil && now.Sub(fi2.ModTime()) > s.WaiterStaleAfter {
+			if os.Remove(path) == nil {
+				res.StaleWaiters++
+			}
+		}
+	}
+	return nil
+}
+
+// removeQueueEntry deletes any queue entry for the given waiter ID. Caller
+// holds the guard.
+func (s *Store) removeQueueEntry(dir, id string) {
 	qdir := filepath.Join(dir, queueDir)
 	entries, err := os.ReadDir(qdir)
 	if err != nil {
 		return
 	}
-	suffix := "-" + token + ".json"
+	suffix := "-" + id + ".json"
 	for _, e := range entries {
 		if strings.HasSuffix(e.Name(), suffix) {
 			os.Remove(filepath.Join(qdir, e.Name()))

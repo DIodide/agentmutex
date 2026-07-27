@@ -1,10 +1,10 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -17,6 +17,7 @@ func cmdStatus(args []string) int {
 		"status [flags] [<key>]")
 	dir := dirFlag(fs)
 	jsonOut := fs.Bool("json", false, "machine-readable output")
+	exitCode := fs.Bool("exit-code", false, "exit by state for scripting: 0 held, 3 free, 4 expired, 5 corrupt/unreadable (requires <key>)")
 	if code, done := parseFlags(fs, args); done {
 		return code
 	}
@@ -29,6 +30,10 @@ func cmdStatus(args []string) int {
 		return fail(err)
 	}
 	if fs.NArg() == 0 {
+		if *exitCode {
+			fmt.Fprintf(os.Stderr, "agentmutex: --exit-code requires a <key>\n")
+			return ExitUsage
+		}
 		return listLocks(st, *jsonOut)
 	}
 	key := fs.Arg(0)
@@ -42,9 +47,21 @@ func cmdStatus(args []string) int {
 	}
 	if *jsonOut {
 		printJSON(redactTokens(ks))
-		return ExitOK
+	} else {
+		printKeyStatus(ks)
 	}
-	printKeyStatus(ks)
+	if *exitCode {
+		switch ks.State {
+		case "held":
+			return ExitOK
+		case "free":
+			return 3
+		case "expired":
+			return 4
+		default: // corrupt / unreadable
+			return 5
+		}
+	}
 	return ExitOK
 }
 
@@ -114,9 +131,21 @@ func printKeyStatus(ks *mutex.KeyStatus) {
 	now := time.Now()
 	fmt.Printf("key:      %s\n", ks.Key)
 	fmt.Printf("state:    %s\n", ks.State)
+	if ks.State == "corrupt" || ks.State == "unreadable" {
+		if ks.Error != "" {
+			fmt.Printf("error:    %s\n", ks.Error)
+		}
+		fmt.Printf("fix:      a human should inspect it, then 'agentmutex force-release --yes %s'\n", ks.Key)
+	}
 	if ks.Holder != nil {
 		h := ks.Holder
-		fmt.Printf("holder:   %s (pid %d on %s)\n", h.Agent, h.PID, h.Host)
+		// Agent already defaults to user@host; don't repeat the host when it
+		// is the tail of the agent name.
+		if strings.HasSuffix(h.Agent, "@"+h.Host) {
+			fmt.Printf("holder:   %s (pid %d)\n", h.Agent, h.PID)
+		} else {
+			fmt.Printf("holder:   %s (pid %d on %s)\n", h.Agent, h.PID, h.Host)
+		}
 		if h.Reason != "" {
 			fmt.Printf("reason:   %s\n", h.Reason)
 		}
@@ -154,6 +183,7 @@ func cmdWait(args []string) int {
 	timeout := fs.Duration("timeout", 0, "give up after this long (exit 11); 0 = wait forever")
 	poll := fs.Duration("poll", mutex.DefaultPollInterval, "poll interval (10ms–10s)")
 	quiet := fs.Bool("quiet", false, "suppress progress messages on stderr")
+	jsonOut := fs.Bool("json", false, "on success, print the final free/expired snapshot as JSON")
 	if code, done := parseFlags(fs, args); done {
 		return code
 	}
@@ -167,13 +197,18 @@ func cmdWait(args []string) int {
 		fmt.Fprintf(os.Stderr, "agentmutex: %v\n", err)
 		return ExitUsage
 	}
+	if err := validateTimeout(*timeout); err != nil {
+		fmt.Fprintf(os.Stderr, "agentmutex: %v\n", err)
+		return ExitUsage
+	}
 	st, err := openStore(*dir)
 	if err != nil {
 		return fail(err)
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigc)
 	start := time.Now()
 	var deadline time.Time
 	if *timeout > 0 {
@@ -186,13 +221,15 @@ func cmdWait(args []string) int {
 			return fail(err)
 		}
 		if ks.State == "free" || ks.State == "expired" {
-			if !*quiet {
+			if *jsonOut {
+				printJSON(redactTokens(ks))
+			} else if !*quiet {
 				fmt.Fprintf(os.Stderr, "agentmutex: %s is free (waited %s)\n", key, humanDur(time.Since(start)))
 			}
 			return ExitOK
 		}
-		if ks.State == "corrupt" || ks.Holder == nil {
-			return fail(fmt.Errorf("state for %s is corrupt; a human should inspect it and run 'agentmutex force-release %s'", key, key))
+		if ks.State == "corrupt" || ks.State == "unreadable" || ks.Holder == nil {
+			return fail(fmt.Errorf("state for %s is %s; a human should inspect it and run 'agentmutex force-release --yes %s'", key, ks.State, key))
 		}
 		if !*quiet && !time.Now().Before(nextProgress) {
 			h := ks.Holder
@@ -205,9 +242,9 @@ func cmdWait(args []string) int {
 			return ExitTimeout
 		}
 		select {
-		case <-ctx.Done():
+		case s := <-sigc:
 			fmt.Fprintf(os.Stderr, "agentmutex: interrupted\n")
-			return 130
+			return signalExit(s)
 		case <-time.After(*poll):
 		}
 	}
@@ -237,9 +274,22 @@ func cmdPrune(args []string) int {
 		printJSON(res)
 		return ExitOK
 	}
-	fmt.Printf("pruned %d expired lease(s), %d stale waiter entrie(s)\n", len(res.ExpiredLeases), res.StaleWaiters)
+	fmt.Printf("pruned %s, %s\n",
+		plural(len(res.ExpiredLeases), "expired lease", "expired leases"),
+		plural(res.StaleWaiters, "stale waiter entry", "stale waiter entries"))
 	for _, k := range res.ExpiredLeases {
 		fmt.Printf("  expired lease: %s\n", k)
 	}
+	for _, e := range res.Errors {
+		fmt.Fprintf(os.Stderr, "  warning: %s\n", e)
+	}
 	return ExitOK
+}
+
+// plural formats a count with the grammatically correct noun.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, one)
+	}
+	return fmt.Sprintf("%d %s", n, many)
 }

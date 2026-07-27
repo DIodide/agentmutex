@@ -138,8 +138,13 @@ Useful flags on `acquire`/`run`: `--ttl 20m`, `--timeout 30m` (give up
 waiting), `--no-wait` (try-lock), `--reason "why"`, `--agent name`,
 `--quiet`. `acquire` also takes `--json`; `run` also takes
 `--on-lease-loss terminate|continue` (what to do if the lease is somehow
-lost mid-command — default `terminate`). Flags go before positional
-arguments.
+lost mid-command — default `terminate`). `status` takes `--exit-code` for
+scripting (0 held, 3 free, 4 expired, 5 corrupt/unreadable) and `wait` takes
+`--json`. Flags go before positional arguments. Aliases: `lock`/`unlock`/`ls`.
+
+Inside `run`, the wrapped command inherits `AGENTMUTEX_LEASE_KEY` and
+`AGENTMUTEX_TOKEN` for the held lease, so a script can renew or release early
+and a nested `agentmutex` call can tell it is re-entering the same key.
 
 ### Exit codes
 

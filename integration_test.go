@@ -283,15 +283,19 @@ func TestHelpGoesToStdoutExitZero(t *testing.T) {
 func TestUsageValidation(t *testing.T) {
 	state := t.TempDir()
 	cases := [][]string{
-		{"acquire", "--poll", "-2s", "k"},         // negative poll would panic pre-fix
-		{"acquire", "--poll", "0s", "k"},          // zero poll would busy-spin
-		{"acquire", "--poll", "60s", "k"},         // poll beyond staleness breaks FIFO
-		{"acquire", "--ttl", "0s", "k"},           // silently coerced to 15m pre-fix
-		{"acquire", "bad key"},                    // invalid key is a usage error
-		{"run", "--ttl", "1s", "k", "--", "true"}, // ttl below auto-renew floor
-		{"run", "k", "--ttl", "5m", "--", "true"}, // flags after key footgun
-		{"list", "some-key"},                      // list takes no args
-		{"prune", "some-key"},                     // prune takes no args
+		{"acquire", "--poll", "-2s", "k"},             // negative poll would panic pre-fix
+		{"acquire", "--poll", "0s", "k"},              // zero poll would busy-spin
+		{"acquire", "--poll", "60s", "k"},             // poll beyond staleness breaks FIFO
+		{"acquire", "--ttl", "0s", "k"},               // silently coerced to 15m pre-fix
+		{"acquire", "--timeout", "-5s", "k"},          // negative timeout != wait-forever
+		{"acquire", "bad key"},                        // invalid key is a usage error
+		{"renew", "--ttl", "0s", "--token", "x", "k"}, // renew ttl validated too
+		{"release", "k"},                              // missing token is exit 2, not 1
+		{"run", "--ttl", "1s", "k", "--", "true"},     // ttl below auto-renew floor
+		{"run", "k", "--ttl", "5m", "--", "true"},     // flags after key footgun
+		{"list", "some-key"},                          // list takes no args
+		{"prune", "some-key"},                         // prune takes no args
+		{"status", "--exit-code"},                     // --exit-code needs a key
 	}
 	for _, c := range cases {
 		if err := mutexCmd(t, state, c...).Run(); exitCode(err) != 2 {

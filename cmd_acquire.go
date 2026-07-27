@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -40,7 +39,10 @@ func (af acquireFlags) validate() error {
 	if err := validateTTL(*af.ttl); err != nil {
 		return err
 	}
-	return validatePoll(*af.poll)
+	if err := validatePoll(*af.poll); err != nil {
+		return err
+	}
+	return validateTimeout(*af.timeout)
 }
 
 func cmdAcquire(args []string) int {
@@ -88,13 +90,17 @@ func cmdAcquire(args []string) int {
 // are inference-bound, a ~1s poll interval adds negligible latency while
 // keeping everything inline — no daemon, no notifications.
 func acquireBlocking(st *mutex.Store, key string, af acquireFlags) (*mutex.Holder, int) {
+	// The lease token is the private credential release/renew require; the
+	// waiter ID is a separate public queue identity. Keeping them distinct
+	// means our on-disk queue entry never exposes the future lease token.
 	token := mutex.NewToken()
+	waiterID := mutex.NewToken()
 	opts := mutex.AcquireOpts{
 		TTL:    *af.ttl,
-		Agent:  *af.agent,
+		Agent:  sanitizeMeta(*af.agent),
 		PID:    os.Getpid(),
 		Host:   hostname(),
-		Reason: *af.reason,
+		Reason: sanitizeMeta(*af.reason),
 	}
 	if opts.Agent == "" {
 		opts.Agent = defaultAgent()
@@ -109,13 +115,14 @@ func acquireBlocking(st *mutex.Store, key string, af acquireFlags) (*mutex.Holde
 		return res.Holder, ExitOK
 	}
 	if *af.noWait {
-		fmt.Fprintf(os.Stderr, "agentmutex: %s is %s\n", key, describeBlock(res, st, key, token))
+		fmt.Fprintf(os.Stderr, "agentmutex: %s is %s\n", key, describeBlock(res, st, key, ""))
 		return nil, ExitHeld
 	}
 
 	// Slow path: join the FIFO queue and poll.
+	opts.WaiterID = waiterID
 	w := mutex.Waiter{
-		Token:      token,
+		ID:         waiterID,
 		Agent:      opts.Agent,
 		PID:        opts.PID,
 		Host:       opts.Host,
@@ -128,8 +135,9 @@ func acquireBlocking(st *mutex.Store, key string, af acquireFlags) (*mutex.Holde
 	}
 	opts.Enqueued = true
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigc)
 
 	start := time.Now()
 	var deadline time.Time
@@ -151,7 +159,7 @@ func acquireBlocking(st *mutex.Store, key string, af acquireFlags) (*mutex.Holde
 		}
 		if !*af.quiet && !time.Now().Before(nextProgress) {
 			fmt.Fprintf(os.Stderr, "agentmutex: waiting for %s — %s (waited %s)\n",
-				key, describeBlock(res, st, key, token), humanDur(time.Since(start)))
+				key, describeBlock(res, st, key, waiterID), humanDur(time.Since(start)))
 			nextProgress = time.Now().Add(15 * time.Second)
 		}
 		if err := st.Heartbeat(entry, w); err != nil && !*af.quiet {
@@ -160,7 +168,7 @@ func acquireBlocking(st *mutex.Store, key string, af acquireFlags) (*mutex.Holde
 		if !deadline.IsZero() && !time.Now().Before(deadline) {
 			st.Dequeue(entry)
 			fmt.Fprintf(os.Stderr, "agentmutex: timed out after %s waiting for %s (%s)\n",
-				humanDur(*af.timeout), key, describeBlock(res, st, key, token))
+				humanDur(*af.timeout), key, describeBlock(res, st, key, waiterID))
 			return nil, ExitTimeout
 		}
 		// Jittered sleep so simultaneous waiters do not poll in lockstep.
@@ -171,10 +179,10 @@ func acquireBlocking(st *mutex.Store, key string, af acquireFlags) (*mutex.Holde
 			}
 		}
 		select {
-		case <-ctx.Done():
+		case s := <-sigc:
 			st.Dequeue(entry)
 			fmt.Fprintf(os.Stderr, "agentmutex: interrupted while waiting for %s\n", key)
-			return nil, 130
+			return nil, signalExit(s)
 		case <-time.After(sleep):
 		}
 	}

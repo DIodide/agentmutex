@@ -35,6 +35,10 @@ JSON shape (stable):
 }
 ```
 
+For scripting, `agentmutex status --exit-code <key>` maps state to an exit
+code (0 held, 3 free, 4 expired, 5 corrupt/unreadable) so you can branch
+without parsing JSON.
+
 Interpreting `state`:
 
 - `held` — an agent is working; `expires_at` is the worst-case wait if that
@@ -43,6 +47,9 @@ Interpreting `state`:
   acquirer takes over automatically; nothing needs cleanup to make progress.
 - `free` — available; a fresh waiter in `waiters` will grab it within ~1s.
 - `corrupt` — unparseable state file; needs a human (see force-release).
+- `unreadable` — an I/O error (bad permissions, or `holder.json` replaced by
+  a directory) blocks reading the lease; a human should `force-release --yes`
+  it. `list` surfaces these rather than hiding them.
 
 ## Waiting for a lock to be released / ready
 

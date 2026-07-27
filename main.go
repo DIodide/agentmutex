@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime/debug"
 )
 
 // version is stamped at build time via -ldflags "-X main.version=...".
@@ -38,16 +39,20 @@ Commands:
   prune                  Remove expired leases and stale queue entries
   version                Print version
 
+Aliases: lock=acquire, unlock=release, ls=list.
+
 Keys are structured namespaces matching the resource they protect:
   deploy:staging     service:api:database     account:12345
 
-Flags go before positional arguments. Run 'agentmutex <command> -h' for
-command flags.
+Flags go before positional arguments. Run 'agentmutex <command> -h' (or
+'agentmutex help <command>') for command flags.
 
 Environment:
   AGENTMUTEX_DIR     State directory (default ~/.agentmutex)
   AGENTMUTEX_TOKEN   Default token for release/renew
   AGENTMUTEX_AGENT   Default agent name
+  Inside 'run', the child also sees AGENTMUTEX_LEASE_KEY and AGENTMUTEX_TOKEN
+  for the held lease (enabling early release / renew from the command).
 
 Exit codes:
   0 success   2 usage    10 lock held    11 timed out    12 not lock holder
@@ -65,6 +70,14 @@ func run(args []string) int {
 		return ExitUsage
 	}
 	cmd, rest := args[0], args[1:]
+	// `help <command>` and `<command> help` both show that command's help.
+	if (cmd == "help" || cmd == "--help" || cmd == "-h") && len(rest) == 1 {
+		return dispatch(rest[0], []string{"-h"})
+	}
+	return dispatch(cmd, rest)
+}
+
+func dispatch(cmd string, rest []string) int {
 	switch cmd {
 	case "acquire", "lock":
 		return cmdAcquire(rest)
@@ -85,7 +98,7 @@ func run(args []string) int {
 	case "prune":
 		return cmdPrune(rest)
 	case "version", "--version", "-v":
-		fmt.Printf("agentmutex %s\n", version)
+		fmt.Printf("agentmutex %s\n", buildVersion())
 		return ExitOK
 	case "help", "--help", "-h":
 		fmt.Print(rootUsage)
@@ -94,4 +107,18 @@ func run(args []string) int {
 		fmt.Fprintf(os.Stderr, "agentmutex: unknown command %q\n\n%s", cmd, rootUsage)
 		return ExitUsage
 	}
+}
+
+// buildVersion returns the ldflags-stamped version, falling back to the
+// module version embedded by `go install` (which does not set ldflags).
+func buildVersion() string {
+	if version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if v := info.Main.Version; v != "" && v != "(devel)" {
+			return v
+		}
+	}
+	return version
 }

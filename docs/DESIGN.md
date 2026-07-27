@@ -21,10 +21,17 @@ $AGENTMUTEX_DIR (default ~/.agentmutex)
 └── locks/
     └── <encoded-key>/          # key percent-encoded to be filesystem-safe
         ├── guard               # flock(2) target; empty; never deleted
-        ├── holder.json         # current lease, absent when free
+        ├── holder.json         # current lease (mode 0600), absent when free
         └── queue/
-            └── <%020d-arrival-unixnano>-<token>.json
+            └── <%020d-arrival-unixnano>-<waiter-id>.json
 ```
+
+The per-key directory is mode 0700 and `holder.json` is 0600, so the lease
+token in the holder document is not readable by other users. Queue entry
+names and bodies use a public **waiter id**, distinct from the private lease
+token, so a waiter's presence never discloses the token it will receive on
+winning. (Among processes of the *same* user the filesystem is a shared trust
+domain — this is advisory locking, not a security boundary.)
 
 Keys are percent-encoded (bytes outside `[A-Za-z0-9._-]` become `%XX`) so the
 mapping is reversible and safe on every platform, including Windows where `:`
@@ -38,11 +45,14 @@ Everything reduces to two well-understood filesystem guarantees:
    prune) runs while holding an exclusive `flock(2)` on `guard`. Critical
    sections are single read-modify-write sequences lasting milliseconds. The
    kernel drops the lock when the process exits, *however* it exits, so a
-   SIGKILLed CLI cannot wedge the store. On Windows (no flock) the guard is
-   an `O_EXCL` marker file with a 60s staleness reclaim; reclaim is
-   *rename-based* (exactly one contender wins the rename) and release
-   verifies marker identity, so a raced reclaim can neither delete a live
-   marker nor be deleted by the stale holder it displaced.
+   SIGKILLed CLI cannot wedge the store. The acquire is a bounded `LOCK_NB`
+   poll (not a blocking `LOCK_EX`), so a peer wedged inside the guard fails
+   the waiter loudly after `guardAcquireMax` rather than hanging every
+   command forever. On Windows (no flock) the guard is an `O_EXCL` marker
+   file with a 60s staleness reclaim; reclaim is *rename-based* (exactly one
+   contender wins the rename) and release verifies marker identity, so a
+   raced reclaim can neither delete a live marker nor be deleted by the stale
+   holder it displaced.
 
 2. **Atomic document replace (rename)** — `holder.json` is written to a temp
    file and `rename(2)`d into place. Readers (`status`, `list`, monitoring
@@ -103,7 +113,7 @@ renew occasionally). Each liveness signal matches its role's natural cadence.
 | Who dies | What happens |
 |---|---|
 | Holder, mid-work | Lease expires at TTL; next fresh queue head displaces it. `run` auto-renews at TTL/3 (which is why `run` requires `--ttl ≥ 5s`), so only SIGKILL of the wrapper leads here. |
-| Holder doesn't die but *loses the lease* (host suspended past TTL, or a human force-release) | `run` detects it on the next renew: by default it terminates the command (SIGTERM, then SIGKILL after 10s) and exits 14, because continuing would mutate concurrently with the new holder. `--on-lease-loss continue` opts out. |
+| Holder doesn't die but *loses the lease* (host suspended past TTL, a human force-release, or renewals failing past the TTL) | `run` detects it on the next renew: by default it terminates the command's whole process group (SIGTERM, then SIGKILL after 10s) and exits 14, because continuing would mutate concurrently with the new holder. `--on-lease-loss continue` opts out. On Unix the child runs in its own process group so backgrounded grandchildren are fenced too; on Windows only the direct child is terminated (`run` warns). |
 | Waiter, mid-wait | Its queue entry goes stale in 30s and is skipped/pruned. |
 | CLI, holding the guard | Kernel releases the flock at process exit. (Windows fallback: 60s staleness reclaim.) |
 | CLI, mid-write of holder.json | The temp file is orphaned; the rename never happened, so state is unchanged. |

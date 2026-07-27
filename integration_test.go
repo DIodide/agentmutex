@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,11 +18,13 @@ import (
 
 var binPath string
 
-// TestMain doubles as the "agent workload" helper: when re-exec'd with
-// AGENTMUTEX_TEST_MODE=increment it performs a deliberately racy
-// read-sleep-write on a counter file. Only mutual exclusion makes it safe.
+// TestMain doubles as the "agent workload" helper (portable stand-ins for
+// shell commands): AGENTMUTEX_TEST_MODE=increment performs a deliberately
+// racy read-sleep-write on a counter file — only mutual exclusion makes it
+// safe — and AGENTMUTEX_TEST_MODE=sleep blocks for AGENTMUTEX_TEST_SECONDS.
 func TestMain(m *testing.M) {
-	if os.Getenv("AGENTMUTEX_TEST_MODE") == "increment" {
+	switch os.Getenv("AGENTMUTEX_TEST_MODE") {
+	case "increment":
 		file := os.Getenv("AGENTMUTEX_TEST_FILE")
 		data, _ := os.ReadFile(file)
 		n, _ := strconv.Atoi(strings.TrimSpace(string(data)))
@@ -31,6 +34,10 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 		os.Exit(0)
+	case "sleep":
+		secs, _ := strconv.Atoi(os.Getenv("AGENTMUTEX_TEST_SECONDS"))
+		time.Sleep(time.Duration(secs) * time.Second)
+		os.Exit(0)
 	}
 
 	dir, err := os.MkdirTemp("", "agentmutex-bin")
@@ -39,6 +46,9 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	binPath = filepath.Join(dir, "agentmutex")
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
 	if out, err := exec.Command("go", "build", "-o", binPath, ".").CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "build failed: %v\n%s", err, out)
 		os.Exit(1)
@@ -314,8 +324,10 @@ func TestWaitOnCorruptStateErrsInsteadOfPanic(t *testing.T) {
 
 func TestLeaseLossTerminatesRun(t *testing.T) {
 	state := t.TempDir()
-	// run with the minimum TTL so renew cadence is fast (5s/3 ≈ 1.7s).
-	cmd := mutexCmd(t, state, "run", "--quiet", "--ttl", "5s", "k", "--", "sleep", "30")
+	// run with the minimum TTL so renew cadence is fast (5s/3 ≈ 1.7s). The
+	// child is our portable sleep helper (Windows runners have no `sleep`).
+	cmd := mutexCmd(t, state, "run", "--quiet", "--ttl", "5s", "k", "--", os.Args[0])
+	cmd.Env = append(cmd.Env, "AGENTMUTEX_TEST_MODE=sleep", "AGENTMUTEX_TEST_SECONDS=30")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}

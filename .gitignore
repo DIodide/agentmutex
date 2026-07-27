@@ -1,0 +1,14 @@
+# Binaries
+/agentmutex
+/agentmutex.exe
+/dist/
+
+# Test and coverage artifacts
+*.test
+*.out
+coverage.html
+
+# Editor noise
+.DS_Store
+.idea/
+.vscode/

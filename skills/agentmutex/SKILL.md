@@ -18,53 +18,91 @@ behind other agents), auto-renews while your command runs, and always
 releases — even if the command fails:
 
 ```bash
-agentmutex run --timeout 30m --reason "deploy v1.2.3" deploy:staging -- ./deploy.sh staging
+# Tag-deploy to the single shared staging environment. --ttl covers the whole
+# build+deploy; run auto-renews at ttl/3 so a slow build never drops the lock.
+agentmutex run --ttl 20m --timeout 40m \
+  --agent "$AGENT_ID" --reason "deploy tag v1.2.3 (sha abc123) to staging" \
+  deploy:staging -- ./deploy.sh v1.2.3
 ```
 
-- `--timeout 30m` bounds how long you'll wait in the queue (exit 11 on
-  timeout). Pick roughly 2× the longest expected hold. Without it you wait
-  forever — fine for scripts, bad inside a shell tool call with its own
-  timeout.
-- `--reason` tells other agents (and humans) what you're doing. Always set it.
-- Everything after `--` runs only once the lease is yours.
-- Long waits are normal and healthy: it means another agent is mid-deploy and
-  you just avoided destroying their work. Prefer launching this in the
-  background (or with a generous tool timeout) over skipping the lock.
+- **`--ttl` must cover your worst-case hold** (build + deploy). `run`
+  auto-renews at `ttl/3`, so the TTL is really your crash-recovery budget: if
+  your agent is killed mid-deploy, others wait out the remaining TTL before
+  taking over. For a 5–10 min build, `--ttl 15m`–`20m` is sensible. Too small
+  risks a mid-deploy expiry on a CPU-pegged box; the floor is 5s.
+- **`--timeout`** bounds queue wait (exit 11). Size it for hold × expected
+  queue depth (N agents each holding ~T ⇒ up to N·T), not just one hold.
+  Without it you wait forever — dangerous inside an agent tool call that has
+  its own timeout and will be killed while merely queued. Prefer launching a
+  long deploy in the **background** (`nohup … &` / detached) and polling
+  `agentmutex status`, so a turn-ending signal doesn't kill a queued deploy.
+- **`--agent "$AGENT_ID"`**: every agent on one box otherwise shows the same
+  `user@host` identity, so `status`/`list`/`force-release` can't tell you
+  apart. Set a unique id per agent.
+- **`--reason`**: record *what* is deploying (tag + sha). It's shown in
+  `list`/`status` so humans and queued agents see what's in flight. Always set it.
+- **`--max-hold 25m`** (optional): abort with exit 14 if the build wedges and
+  holds staging longer than expected, instead of blocking everyone forever.
 
-## Choosing the key
+## Choosing the key: lock the ENVIRONMENT, not the tag
 
-Lock the **business entity you are mutating**, using structured namespaces:
+**The single most important rule for deploys.** There is one staging
+environment. Two agents deploying *different* tags to staging still collide —
+the second build overwrites the first. So they must serialize on the
+**environment**, not on the tag or version:
 
-| Situation | Key |
-|---|---|
-| Deploying to staging | `deploy:staging` |
-| Deploying service `api` to production | `deploy:api:production` |
-| Migrating a database | `service:api:database` |
-| Editing a shared file | `repo:frontend/file:auth.ts` |
-| Acting on a customer account | `account:12345` |
+| Deploying… | Key ✅ | NOT ❌ |
+|---|---|---|
+| any tag to staging | `deploy:staging` | `deploy:tag:v1.2.3` ← different tags wouldn't serialize! |
+| any tag to production | `deploy:production` | `deploy:v2` |
+| the `api` service's own staging | `deploy:api:staging` | — |
 
-Rules: pick the finest key that still covers your whole mutation; use the
-same key spelling as everyone else (check `agentmutex list` for the names
-already in use); different resources → different keys, so unrelated work
-stays parallel.
+Rules:
+- **Key by the shared resource that gets clobbered** (the environment), never
+  by the thing you happen to be pushing (the tag/version/sha). Keying by tag
+  silently defeats mutual exclusion — different-tag deploys run concurrently.
+- If your build+deploy is triggered *asynchronously* by moving a git tag
+  (push tag → CI builds for 10 min), the critical section is the **whole
+  build**, not the fast tag push. Either wrap a command that blocks until the
+  deploy finishes, or hold the lease across the tag push *and* the wait.
+- Use the same spelling everyone else uses — check `agentmutex list` first.
+- Different environments → different keys, so staging and production deploys
+  run in parallel.
+
+Other resources follow the same "lock what gets clobbered" rule:
+`service:api:database` for a migration, `repo:frontend/file:auth.ts` for a
+shared file, `account:12345` for an account.
 
 ## Manual lifecycle (multi-step work)
 
-When the critical section spans several separate commands:
+Prefer `run` — it can't leak this way. Only reach for manual acquire/release
+when the critical section spans several separate commands. If you do,
+**you MUST check that the acquire succeeded before mutating anything** — a
+failed acquire leaves `$TOKEN` empty and, without the guard below, the shell
+would deploy *with no lock*, which is the exact clobber you're preventing:
 
 ```bash
-TOKEN=$(agentmutex acquire --ttl 20m --timeout 30m --reason "schema migration" service:api:database)
-# ... IMPORTANT: re-read state NOW, after acquiring — see below ...
+set -euo pipefail
+TOKEN=$(agentmutex acquire --ttl 20m --timeout 40m \
+  --agent "$AGENT_ID" --reason "schema migration" service:api:database) || {
+    echo "could not acquire lock (someone else is deploying); aborting" >&2
+    agentmutex status service:api:database >&2
+    exit 1   # DO NOT proceed to mutate — you don't hold the lock
+}
+trap 'agentmutex release --token "$TOKEN" service:api:database' EXIT
+# IMPORTANT: re-read fresh state NOW, after acquiring (see the discipline below)
 ./migrate.sh && ./verify.sh
-agentmutex release --token "$TOKEN" service:api:database
+# trap releases on exit, even on failure
 ```
 
 - Save the token — it's the only way to release/renew. Losing it means
   waiting out the TTL or asking a human to `force-release`.
-- Size `--ttl` to ≥ 2× your worst-case duration, or `agentmutex renew
-  --token "$TOKEN" --ttl 20m <key>` before it expires.
-- In shell scripts, release in a `trap ... EXIT` so failures don't strand the
-  lease. (Or just use `run`, which does all of this for you.)
+- **Manual `acquire` does NOT auto-renew** (only `run` does). Size `--ttl` to
+  ≥ 2× your worst-case duration, or `agentmutex renew --token "$TOKEN" --ttl
+  20m <key>` before it expires — otherwise the lease can lapse mid-migration
+  and another agent takes over.
+- Always release in a `trap … EXIT` so a failure can't strand the lease.
+  (Or just use `run`, which does all of this for you.)
 
 ## The pessimistic discipline
 

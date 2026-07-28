@@ -99,14 +99,35 @@ acquire:                       release:                renew:
    - **Heartbeat**: touch our queue entry's mtime, proving we're alive.
 4. On success/timeout/interrupt, remove our queue entry.
 
-A waiter whose entry mtime is older than 30s (`WaiterStaleAfter`) stopped
-heartbeating — it was killed mid-wait. Stale entries are skipped by everyone
-and cleaned by `prune`, so a dead waiter never blocks the queue.
+Waiter liveness is **PID-based on the local host**: a waiter records its
+`host` and `pid`, and a same-host waiter is a live contender as long as its
+process exists (`kill(pid, 0)`), bounded by a generous `WaiterPIDGrace`
+(default 5m) against PID reuse. This matters for deploys: the agent holding
+the lease often runs a CPU-saturating build on the same box, which can starve
+a co-located queued agent of scheduling long enough to miss its 1s heartbeat.
+Under a pure mtime rule that live-but-starved agent would be wrongly skipped
+and **barged by a later arrival — a FIFO violation**. PID-liveness keeps its
+slot. Conversely, a same-host waiter whose process is *gone* is dropped
+immediately, so a crashed queue head can't block a live agent for the whole
+staleness window. Waiters from another host fall back to the mtime heartbeat
+(we can't probe a remote PID). Stale/dead entries are cleaned by `prune`.
 
-Note the asymmetry, and why it's sound: *waiter* liveness is mtime-based
-(waiters actively poll, so silence for 30s means death), while *holder*
-liveness is TTL-based (holders are busy doing minutes-long work and merely
-renew occasionally). Each liveness signal matches its role's natural cadence.
+Note the asymmetry, and why it's sound: *holder* liveness is TTL-based
+(holders do minutes-long work and merely renew occasionally), while *waiter*
+liveness is process-based (a waiter is a live process polling in a loop).
+Each liveness signal matches its role's natural cadence.
+
+### Reclaiming a lease cleared mid-run
+
+If `run`'s lease vanishes while its command is still executing — a human
+`force-release`d a lock they thought was stuck, or `prune` removed it after a
+starved renew — `run` does not blindly keep deploying unprotected. On the next
+renew tick it **re-acquires** the key (bypassing the FIFO queue, since it was
+the active holder) to re-establish exclusivity, rotating to a fresh token.
+Only if a *different* live holder now owns the key (a genuine collision) does
+it treat the lease as lost and terminate the command (exit 14). This keeps the
+single staging environment protected through routine operator actions while
+still catching real double-deploys.
 
 ## Crash matrix
 

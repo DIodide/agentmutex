@@ -104,15 +104,21 @@ func listLocks(st *mutex.Store, jsonOut bool) int {
 	}
 	now := time.Now()
 	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "KEY\tSTATE\tHOLDER\tEXPIRES\tWAITERS")
+	// HELD-FOR (elapsed since acquire) beats EXPIRES here: for the golden
+	// auto-renewing `run` lease, EXPIRES is a near-constant ~TTL and tells
+	// you nothing, whereas a large HELD-FOR is exactly how you spot a stuck
+	// deploy. REASON shows what tag/sha each environment is deploying.
+	fmt.Fprintln(w, "KEY\tSTATE\tHOLDER\tHELD-FOR\tREASON\tWAITERS")
 	for _, ks := range all {
-		holder, expires := "-", "-"
+		holder, held, reason := "-", "-", "-"
 		if ks.Holder != nil {
 			holder = ks.Holder.Agent
+			held = humanDur(now.Sub(ks.Holder.AcquiredAt))
 			if ks.State == "expired" {
-				expires = fmt.Sprintf("%s ago", humanDur(now.Sub(ks.Holder.ExpiresAt)))
-			} else {
-				expires = fmt.Sprintf("in %s", humanDur(ks.Holder.ExpiresAt.Sub(now)))
+				held += " (stale)"
+			}
+			if ks.Holder.Reason != "" {
+				reason = truncate(ks.Holder.Reason, 40)
 			}
 		}
 		fresh := 0
@@ -121,10 +127,19 @@ func listLocks(st *mutex.Store, jsonOut bool) int {
 				fresh++
 			}
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\n", ks.Key, ks.State, holder, expires, fresh)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\n", ks.Key, ks.State, holder, held, reason, fresh)
 	}
 	w.Flush()
 	return ExitOK
+}
+
+// truncate shortens s to n runes with an ellipsis, for table cells.
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
 }
 
 func printKeyStatus(ks *mutex.KeyStatus) {
@@ -149,11 +164,18 @@ func printKeyStatus(ks *mutex.KeyStatus) {
 		if h.Reason != "" {
 			fmt.Printf("reason:   %s\n", h.Reason)
 		}
-		fmt.Printf("acquired: %s (%s ago)\n", h.AcquiredAt.Format(time.RFC3339), humanDur(now.Sub(h.AcquiredAt)))
-		if ks.State == "expired" {
-			fmt.Printf("expired:  %s ago\n", humanDur(now.Sub(h.ExpiresAt)))
+		fmt.Printf("held for: %s (acquired %s)\n", humanDur(now.Sub(h.AcquiredAt)), h.AcquiredAt.Format(time.RFC3339))
+		// Renew recency separates a live auto-renewing deploy from one coasting
+		// to its TTL (crashed/manual): a recent renew means the holder is alive.
+		if h.RenewedAt != nil {
+			fmt.Printf("renewed:  %s ago (holder is auto-renewing — likely a live deploy)\n", humanDur(now.Sub(*h.RenewedAt)))
 		} else {
-			fmt.Printf("expires:  in %s\n", humanDur(h.ExpiresAt.Sub(now)))
+			fmt.Printf("renewed:  never (holder not auto-renewing; expires at its TTL)\n")
+		}
+		if ks.State == "expired" {
+			fmt.Printf("expired:  %s ago — a waiter may take over\n", humanDur(now.Sub(h.ExpiresAt)))
+		} else {
+			fmt.Printf("expires:  in %s (worst-case takeover if the holder crashed now)\n", humanDur(h.ExpiresAt.Sub(now)))
 		}
 	}
 	fresh := make([]mutex.Waiter, 0, len(ks.Waiters))
@@ -167,7 +189,11 @@ func printKeyStatus(ks *mutex.KeyStatus) {
 	}
 	fmt.Printf("waiters:  %d\n", len(fresh))
 	for i, wt := range fresh {
-		fmt.Printf("  %d. %s — waiting %s\n", i+1, wt.Agent, humanDur(now.Sub(wt.EnqueuedAt)))
+		line := fmt.Sprintf("  %d. %s — waiting %s", i+1, wt.Agent, humanDur(now.Sub(wt.EnqueuedAt)))
+		if wt.Reason != "" {
+			line += fmt.Sprintf(" (%s)", truncate(wt.Reason, 50))
+		}
+		fmt.Println(line)
 	}
 	if stale > 0 {
 		fmt.Printf("          (+%d stale entries; 'agentmutex prune' cleans them)\n", stale)

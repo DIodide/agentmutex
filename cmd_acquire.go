@@ -51,6 +51,7 @@ func cmdAcquire(args []string) int {
 	dir := dirFlag(fs)
 	af := registerAcquireFlags(fs)
 	jsonOut := fs.Bool("json", false, "print the lease as JSON instead of just the token")
+	tokenFile := fs.String("token-file", "", "write the token to this file (mode 0600) instead of stdout — keeps it out of CI logs")
 	if code, done := parseFlags(fs, args); done {
 		return code
 	}
@@ -74,12 +75,24 @@ func cmdAcquire(args []string) int {
 	if code != ExitOK {
 		return code
 	}
-	if *jsonOut {
+	if *tokenFile != "" {
+		if werr := os.WriteFile(*tokenFile, []byte(holder.Token+"\n"), 0o600); werr != nil {
+			return fail(fmt.Errorf("writing --token-file: %w", werr))
+		}
+	}
+	switch {
+	case *jsonOut:
+		red := *holder
+		if *tokenFile != "" {
+			red.Token = "" // don't also echo it to stdout
+		}
 		printJSON(struct {
 			*mutex.Holder
 			WaitedSeconds float64 `json:"waited_seconds"`
-		}{holder, time.Since(start).Seconds()})
-	} else {
+		}{&red, time.Since(start).Seconds()})
+	case *tokenFile != "":
+		fmt.Fprintf(os.Stderr, "agentmutex: acquired %s; token written to %s\n", key, *tokenFile)
+	default:
 		fmt.Println(holder.Token)
 	}
 	return ExitOK
@@ -156,20 +169,27 @@ func acquireBlocking(st *mutex.Store, key string, af acquireFlags) (*mutex.Holde
 	nextProgress := start // announce immediately on first block
 	for {
 		res, err := st.TryAcquire(key, token, opts)
-		if err != nil {
-			st.Dequeue(entry)
-			return nil, fail(err)
-		}
-		if res.Acquired {
+		switch {
+		case err != nil:
+			// A transient store error (a peer wedged in the guard, an I/O
+			// blip). The key was validated up front, so retrying is correct —
+			// crucially, we keep our queue entry rather than dropping to the
+			// back of the line. --timeout / interrupt still bound the wait.
+			if !*af.quiet && !time.Now().Before(nextProgress) {
+				fmt.Fprintf(os.Stderr, "agentmutex: retrying %s (keeping queue position): %v\n", key, err)
+				nextProgress = time.Now().Add(15 * time.Second)
+			}
+		case res.Acquired:
 			if !*af.quiet {
 				fmt.Fprintf(os.Stderr, "agentmutex: acquired %s after %s\n", key, humanDur(time.Since(start)))
 			}
 			return res.Holder, ExitOK
-		}
-		if !*af.quiet && !time.Now().Before(nextProgress) {
-			fmt.Fprintf(os.Stderr, "agentmutex: waiting for %s — %s (waited %s)\n",
-				key, describeBlock(res, st, key, waiterID), humanDur(time.Since(start)))
-			nextProgress = time.Now().Add(15 * time.Second)
+		default:
+			if !*af.quiet && !time.Now().Before(nextProgress) {
+				fmt.Fprintf(os.Stderr, "agentmutex: waiting for %s — %s (waited %s)\n",
+					key, describeBlock(res, st, key, waiterID), humanDur(time.Since(start)))
+				nextProgress = time.Now().Add(15 * time.Second)
+			}
 		}
 		if err := st.Heartbeat(entry, w); err != nil && !*af.quiet {
 			fmt.Fprintf(os.Stderr, "agentmutex: warning: queue heartbeat failed: %v\n", err)

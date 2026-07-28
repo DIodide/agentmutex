@@ -46,14 +46,18 @@ cd agentmutex && make install
 
 ```bash
 # The golden path: acquire → run → auto-renew → release, in one command.
-agentmutex run deploy:staging -- make deploy-staging
+# --ttl covers the whole build+deploy (run auto-renews at ttl/3).
+agentmutex run --ttl 20m --reason "deploy v1.2.3 to staging" \
+  deploy:staging -- make deploy-staging
 
-# Manual lifecycle, when the work spans multiple commands:
-TOKEN=$(agentmutex acquire --ttl 20m --reason "shipping v1.2.3" deploy:staging)
+# Manual lifecycle, when the work spans multiple commands. ALWAYS guard the
+# acquire — a failed lock must abort, never deploy unlocked:
+TOKEN=$(agentmutex acquire --ttl 20m --reason "shipping v1.2.3" deploy:staging) || {
+  echo "someone else is deploying; aborting" >&2; exit 1; }
+trap 'agentmutex release --token "$TOKEN" deploy:staging' EXIT
 make build && make deploy-staging
-agentmutex release --token "$TOKEN" deploy:staging
 
-# Who's holding what?
+# Who's holding what? (list shows what each environment is deploying + for how long)
 agentmutex status deploy:staging
 agentmutex list
 ```
@@ -136,11 +140,21 @@ per resource.
 
 Useful flags on `acquire`/`run`: `--ttl 20m`, `--timeout 30m` (give up
 waiting), `--no-wait` (try-lock), `--reason "why"`, `--agent name`,
-`--quiet`. `acquire` also takes `--json`; `run` also takes
-`--on-lease-loss terminate|continue` (what to do if the lease is somehow
-lost mid-command — default `terminate`). `status` takes `--exit-code` for
-scripting (0 held, 3 free, 4 expired, 5 corrupt/unreadable) and `wait` takes
-`--json`. Flags go before positional arguments. Aliases: `lock`/`unlock`/`ls`.
+`--quiet`. `acquire` also takes `--json` and `--token-file PATH` (keep the
+token out of CI logs). `run` also takes `--on-lease-loss terminate|continue`
+(default `terminate`), `--max-hold 25m` (abort a wedged deploy holding the
+lock too long), and `--export-token` (pass the token to the child so it can
+renew/release — off by default, since env is readable by same-user
+processes). `status` takes `--exit-code` for scripting (0 held, 3 free,
+4 expired, 5 corrupt/unreadable) and `wait` takes `--json`. Flags go before
+positional arguments. Aliases: `lock`/`unlock`/`ls`.
+
+> **All coordinating agents must point at the same store.** Coordination
+> happens through `$AGENTMUTEX_DIR` (default `~/.agentmutex`). If two agents
+> use different directories — e.g. an ephemeral per-job CI dir — they do
+> **not** see each other's locks and both "acquire" successfully: the mutex
+> fails *open*. On a shared deploy box, set `AGENTMUTEX_DIR` to one durable,
+> shared path for every agent.
 
 Inside `run`, the wrapped command inherits `AGENTMUTEX_LEASE_KEY`,
 `AGENTMUTEX_TOKEN`, and `AGENTMUTEX_DIR` for the held lease, so a script can

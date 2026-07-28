@@ -38,6 +38,11 @@ const (
 	DefaultTTL              = 15 * time.Minute
 	DefaultPollInterval     = 1 * time.Second
 	DefaultWaiterStaleAfter = 30 * time.Second
+	// DefaultWaiterPIDGrace bounds how long a *live* same-host waiter may go
+	// without a heartbeat before it is treated as dead anyway. It is generous
+	// because a deploy that saturates the box can starve a co-located queued
+	// agent of CPU for a while; PID-liveness keeps its FIFO slot until then.
+	DefaultWaiterPIDGrace = 5 * time.Minute
 
 	holderFile = "holder.json"
 	guardFile  = "guard"
@@ -130,6 +135,11 @@ type AcquireOpts struct {
 	// Enqueued indicates we have a queue entry that should be removed if
 	// the acquire succeeds.
 	Enqueued bool
+	// Reclaim skips the FIFO queue-head check: use it to re-establish a
+	// lease you were actively holding (e.g. `run` re-taking a key that was
+	// force-released or pruned out from under an in-flight command). It
+	// still refuses a key currently held by a different live holder.
+	Reclaim bool
 }
 
 // AcquireResult reports one TryAcquire attempt.
@@ -149,8 +159,10 @@ type AcquireResult struct {
 type Store struct {
 	Root             string
 	WaiterStaleAfter time.Duration
+	WaiterPIDGrace   time.Duration
 
-	now func() time.Time
+	now  func() time.Time
+	host string
 }
 
 // Open opens (creating if needed) the store at root. An empty root falls
@@ -172,11 +184,31 @@ func Open(root string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Join(root, "locks"), 0o700); err != nil {
 		return nil, fmt.Errorf("cannot create state directory: %w", err)
 	}
+	host, _ := os.Hostname()
 	return &Store{
 		Root:             root,
 		WaiterStaleAfter: DefaultWaiterStaleAfter,
+		WaiterPIDGrace:   DefaultWaiterPIDGrace,
 		now:              time.Now,
+		host:             host,
 	}, nil
+}
+
+// waiterFresh reports whether a waiter is still a live contender. On this
+// host, liveness is authoritative via the process id: a starved-but-alive
+// agent keeps its FIFO slot (up to WaiterPIDGrace, bounding PID-reuse), and a
+// crashed agent is dropped immediately rather than lingering for the whole
+// staleness window. Waiters from another host fall back to the mtime
+// heartbeat, since we can't probe a remote PID.
+func (s *Store) waiterFresh(host string, pid int, mtime, now time.Time) bool {
+	grace := s.WaiterPIDGrace
+	if grace <= 0 {
+		grace = DefaultWaiterPIDGrace
+	}
+	if host != "" && s.host != "" && host == s.host && pid > 0 {
+		return processAlive(pid) && now.Sub(mtime) <= grace
+	}
+	return now.Sub(mtime) <= s.WaiterStaleAfter
 }
 
 func (s *Store) locksDir() string         { return filepath.Join(s.Root, "locks") }
@@ -293,14 +325,17 @@ func (s *Store) TryAcquire(key, token string, o AcquireOpts) (*AcquireResult, er
 		}
 		// Key is free (or the lease expired and can be displaced).
 		// FIFO fairness: only the fresh queue head may take it. Identity is
-		// the public WaiterID, never the private lease token.
-		head, err := s.queueHead(dir, now)
-		if err != nil {
-			return err
-		}
-		if head != nil && head.ID != o.WaiterID {
-			res.Blocker = head
-			return nil
+		// the public WaiterID, never the private lease token. Reclaim bypasses
+		// this — an active holder re-establishing protection jumps the queue.
+		if !o.Reclaim {
+			head, err := s.queueHead(dir, now)
+			if err != nil {
+				return err
+			}
+			if head != nil && head.ID != o.WaiterID {
+				res.Blocker = head
+				return nil
+			}
 		}
 		nh := &Holder{
 			Key:        key,
@@ -518,7 +553,7 @@ func (s *Store) readQueue(dir string, now time.Time) ([]Waiter, error) {
 			continue
 		}
 		w.LastSeen = fi.ModTime()
-		w.Fresh = now.Sub(fi.ModTime()) <= s.WaiterStaleAfter
+		w.Fresh = s.waiterFresh(w.Host, w.PID, fi.ModTime(), now)
 		ws = append(ws, w)
 	}
 	return ws, nil
@@ -688,18 +723,35 @@ func (s *Store) pruneKey(dir, key string, res *PruneResult) error {
 		if q.IsDir() || !strings.HasSuffix(name, ".json") {
 			continue // only real waiter entries count
 		}
-		if now.Sub(fi.ModTime()) <= s.WaiterStaleAfter {
+		// A waiter is prunable only if it is not a live contender — i.e. its
+		// same-host process is gone (or it is a remote waiter past the mtime
+		// window). A CPU-starved-but-alive local agent is kept.
+		host, pid := waiterIdentity(path)
+		if s.waiterFresh(host, pid, fi.ModTime(), now) {
 			continue
 		}
 		// Re-stat immediately before removal: a live waiter may have
 		// heartbeated between ReadDir and here (Heartbeat takes no guard).
-		if fi2, serr := os.Stat(path); serr == nil && now.Sub(fi2.ModTime()) > s.WaiterStaleAfter {
+		if fi2, serr := os.Stat(path); serr == nil && !s.waiterFresh(host, pid, fi2.ModTime(), now) {
 			if os.Remove(path) == nil {
 				res.StaleWaiters++
 			}
 		}
 	}
 	return nil
+}
+
+// waiterIdentity reads just the host/pid from a queue entry (best effort).
+func waiterIdentity(path string) (host string, pid int) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", 0
+	}
+	var w Waiter
+	if json.Unmarshal(data, &w) != nil {
+		return "", 0
+	}
+	return w.Host, w.PID
 }
 
 // removeQueueEntry deletes any queue entry for the given waiter ID. Caller

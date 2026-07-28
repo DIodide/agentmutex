@@ -50,12 +50,32 @@ Interpreting `state`:
 - `held` — an agent is working; `expires_at` is the worst-case wait if that
   agent crashed this instant (live holders renew, so it can move forward).
 - `expired` — the holder stopped renewing (crashed or SIGKILLed). The next
-  acquirer takes over automatically; nothing needs cleanup to make progress.
+  acquirer takes over automatically. **Caveat for deploys:** a SIGKILLed
+  `run` can leave its deploy child still running (orphaned) while the lease
+  shows `expired` — so "expired" does not guarantee the resource is idle.
+  Before taking over a crashed deploy, check nothing is still deploying (no
+  stray build/deploy process, staging not mid-write).
 - `free` — available; a fresh waiter in `waiters` will grab it within ~1s.
 - `corrupt` — unparseable state file; needs a human (see force-release).
 - `unreadable` — an I/O error (bad permissions, or `holder.json` replaced by
   a directory) blocks reading the lease; a human should `force-release --yes`
   it. `list` surfaces these rather than hiding them.
+
+### Is the in-flight deploy healthy or stuck?
+
+`status <key>` shows **held for** (elapsed) and **renewed** (recency). A
+`run`-held deploy auto-renews, so a recent `renewed` means the holder is
+alive; a `held for` far beyond the expected build time means the build is
+wedged. Rule of thumb while waiting on staging:
+
+```bash
+agentmutex status deploy:staging   # look at "held for" vs your build's normal duration
+```
+
+- recent `renewed` + reasonable `held for` → healthy build, keep waiting.
+- `renewed: never` on a lease that should be a `run` deploy, or `held for`
+  ≫ normal build time → likely wedged; a human may need to investigate or the
+  holder should have used `run --max-hold`.
 
 ## Waiting for a lock to be released / ready
 
@@ -71,13 +91,28 @@ To *observe* without claiming (e.g. "tell me when the deploy finishes"):
 agentmutex wait --timeout 20m deploy:staging
 ```
 
+Caveats: `wait` returns as soon as the lease is gone — which includes an
+`expired` (crashed) holder, not just a clean release, and it fires the instant
+the holder releases even if a FIFO waiter is about to reclaim staging in the
+next second. So "wait says free" means "no active lease right now", not
+"staging is idle and yours". If you actually intend to deploy, don't `wait`
+then act — that's a race; use `agentmutex run deploy:staging -- …`, which
+takes its turn in the queue atomically.
+
 Inference-bound polling: agents don't need push notifications — checking once
 per second (the built-in poll) or even once per minute between your other
 actions is plenty. A cheap pattern inside an agent loop:
 
 ```bash
-# Cleanest: let the CLI do the branching (no parsing).
-agentmutex status --exit-code deploy:staging; case $? in 0) echo held;; 3) echo free;; 4) echo expired;; esac
+# Cleanest: let the CLI do the branching (no parsing). Always handle the
+# corrupt/unreadable arm (5) so you're not blind to a wedged staging lock.
+agentmutex status --exit-code deploy:staging
+case $? in
+  0) echo held;;
+  3) echo free;;
+  4) echo expired;;
+  5) echo "WEDGED — needs a human (force-release)";;
+esac
 # Or extract just the state value:
 state=$(agentmutex status --json deploy:staging | sed -n 's/.*"state": "\([a-z]*\)".*/\1/p')
 ```
@@ -87,14 +122,22 @@ a tool call spinning.
 
 ## Inspecting raw state (read-only!)
 
+Use `$AGENTMUTEX_DIR` — on a shared deploy box the store is almost always set
+there, not at `~/.agentmutex`, so hardcoding the home path inspects the wrong
+(often empty) directory during an incident:
+
 ```bash
-ls ~/.agentmutex/locks/                                  # one dir per key (percent-encoded)
-cat ~/.agentmutex/locks/deploy%3Astaging/holder.json     # the lease document
-ls -l ~/.agentmutex/locks/deploy%3Astaging/queue/        # waiters; mtime = last heartbeat
+D="${AGENTMUTEX_DIR:-$HOME/.agentmutex}"
+ls "$D/locks/"                                   # one dir per key (percent-encoded)
+cat "$D/locks/deploy%3Astaging/holder.json"      # the lease document
+ls -l "$D/locks/deploy%3Astaging/queue/"         # waiters; mtime = last heartbeat
 ```
 
-A queue entry whose mtime is >30s old is a dead waiter (they heartbeat every
-poll); it gets skipped automatically and `agentmutex prune` removes it.
+A waiter is treated as dead when its process is gone (checked by PID on this
+host) or, for a same-host live-but-starved agent, once its heartbeat is very
+stale; `agentmutex prune` removes such entries. A live but CPU-starved agent
+(e.g. co-located with a heavy build) keeps its FIFO slot, so the queue stays
+fair even under load.
 
 **Never** create, edit, or delete files under `~/.agentmutex` yourself —
 mutations must go through the CLI, which serializes them with a per-key

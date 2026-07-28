@@ -33,11 +33,47 @@ order. Contributions welcome — see CONTRIBUTING.md.
 - **Event log / audit trail.** `release` deletes `holder.json`, leaving no
   history. An append-only log of acquire/release/expire events would make
   post-incident debugging of agent collisions possible.
-- **`run` timing output.** Emit machine-readable wait duration, hold
-  duration, and renew count (e.g. a JSON line on stderr or `--metrics`), so
-  the calling agent can observe contention.
-- **`list --prefix` filtering.** Filter the lock table by key prefix, natural
-  given the hierarchical key design.
+- **`run` timing output / `--json`.** Emit machine-readable wait duration,
+  hold duration, renew count, and loss cause, so an orchestrating agent gets
+  more than human stderr.
+- **`list --prefix` / state filter.** Filter the lock table by key prefix or
+  by state ("what is deploying right now"), natural given the hierarchical
+  key design.
+
+## Deploy workflow (concurrent tag-deploys)
+
+Surfaced by the deploy-focused hunt; the correctness bugs are fixed (see
+CHANGELOG), these are the remaining ergonomics/capabilities:
+
+- **Structured deploy metadata.** Record the git tag/sha (and the wrapped
+  command) on the lease as first-class fields so `status`/`list` show exactly
+  what each environment is deploying, beyond the free-text `--reason`.
+- **Deploy coalescing.** When several agents queue to deploy the *same* tag,
+  let later ones detect it was already applied and skip, instead of
+  re-deploying serially.
+- **Priority lane.** An urgent rollback currently waits behind every routine
+  staging deploy in strict FIFO; a priority flag would let it jump ahead.
+- **Resumable queue position.** A turn-based agent that can't block
+  continuously restarts at the back of the queue each turn; a durable
+  reservation would hold its place across invocations.
+- **Config/env presets.** Per-project defaults for `--ttl`/`--timeout`/
+  `--reason` so every invocation doesn't re-specify deploy-correct values.
+- **Half-deploy signal.** `run` releases identically on success and failure;
+  a lock-level marker that the last hold ended in a failed/partial deploy
+  would warn the next agent that staging may be in a mixed state.
+
+## Clock robustness
+
+Single-machine coordination assumes a roughly monotonic wall clock. A few
+edges remain (rare, but worth hardening):
+
+- Queue order is a wall-clock `UnixNano` baked into each waiter's filename; a
+  backward clock step (NTP `makestep`, VM snapshot-resume) could let a later
+  arrival sort ahead. A shared monotonic counter would remove this.
+- Freshness and lease expiry compare `now` against stored wall-clock times; a
+  forward step can transiently age the whole queue or expire a live lease
+  early (PID-liveness mitigates the waiter side). Monotonic-clock or
+  heartbeat-delta comparisons would be more robust.
 
 ## Library (`internal/mutex` → public `pkg`)
 

@@ -328,9 +328,10 @@ func TestWaitOnCorruptStateErrsInsteadOfPanic(t *testing.T) {
 
 func TestLeaseLossTerminatesRun(t *testing.T) {
 	state := t.TempDir()
-	// run with the minimum TTL so renew cadence is fast (5s/3 ≈ 1.7s). The
+	// --ttl 9s → renew cadence 3s, so the first reclaim tick is ~3s out,
+	// leaving a wide window for the competitor to take the key at ~1s. The
 	// child is our portable sleep helper (Windows runners have no `sleep`).
-	cmd := mutexCmd(t, state, "run", "--quiet", "--ttl", "5s", "k", "--", os.Args[0])
+	cmd := mutexCmd(t, state, "run", "--quiet", "--ttl", "9s", "k", "--", os.Args[0])
 	cmd.Env = append(cmd.Env, "AGENTMUTEX_TEST_MODE=sleep", "AGENTMUTEX_TEST_SECONDS=30")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -340,14 +341,14 @@ func TestLeaseLossTerminatesRun(t *testing.T) {
 
 	time.Sleep(1 * time.Second) // let it acquire and start the child
 	// Simulate a real collision: break the lock and let a *competitor* take
-	// it. The original run's next renew then sees a different holder
-	// (NotHolderError) — the genuine exclusivity violation that must
-	// terminate the run. (A force-release with no competitor is not a
-	// collision and deliberately does not kill the run.)
+	// and HOLD it (durable file lease). The original run's next renew then
+	// sees a different holder (NotHolderError) — the genuine exclusivity
+	// violation that must terminate the run. (A bare force-release with no
+	// competitor is not a collision: run would just re-acquire.)
 	if err := mutexCmd(t, state, "force-release", "--yes", "k").Run(); err != nil {
 		t.Fatalf("force-release: %v", err)
 	}
-	if err := mutexCmd(t, state, "acquire", "--quiet", "--no-wait", "--agent", "thief", "k").Run(); err != nil {
+	if err := mutexCmd(t, state, "acquire", "--quiet", "--no-wait", "--ttl", "5m", "--agent", "thief", "k").Run(); err != nil {
 		t.Fatalf("competitor acquire: %v", err)
 	}
 
@@ -359,6 +360,36 @@ func TestLeaseLossTerminatesRun(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		cmd.Process.Kill()
 		t.Fatal("run did not terminate after losing its lease to a competitor")
+	}
+}
+
+func TestRunReacquiresAfterBareForceRelease(t *testing.T) {
+	state := t.TempDir()
+	// A force-release with NO competitor must NOT kill the deploy: run
+	// re-acquires the free key and finishes protected, exit 0.
+	cmd := mutexCmd(t, state, "run", "--quiet", "--ttl", "6s", "k", "--", os.Args[0])
+	cmd.Env = append(cmd.Env, "AGENTMUTEX_TEST_MODE=sleep", "AGENTMUTEX_TEST_SECONDS=5")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan int, 1)
+	go func() { done <- exitCode(cmd.Wait()) }()
+	time.Sleep(1 * time.Second)
+	if err := mutexCmd(t, state, "force-release", "--yes", "k").Run(); err != nil {
+		t.Fatalf("force-release: %v", err)
+	}
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("run after bare force-release: exit %d, want 0 (should re-acquire and finish)", code)
+		}
+	case <-time.After(20 * time.Second):
+		cmd.Process.Kill()
+		t.Fatal("run did not finish")
+	}
+	// The key must be free afterwards (run released its re-acquired lease).
+	if err := mutexCmd(t, state, "acquire", "--no-wait", "--quiet", "k").Run(); err != nil {
+		t.Fatalf("key not free after run finished: %v", err)
 	}
 }
 
@@ -459,6 +490,46 @@ func TestStatusExitCodeExpiredAndCorrupt(t *testing.T) {
 	}
 	if got := exitCode(mutexCmd(t, state, "status", "--exit-code", "cor:key").Run()); got != 5 {
 		t.Fatalf("corrupt: want exit 5, got %d", got)
+	}
+}
+
+func TestTokenFileKeepsTokenOffStdout(t *testing.T) {
+	state := t.TempDir()
+	tf := filepath.Join(t.TempDir(), "tok")
+	out, err := mutexCmd(t, state, "acquire", "--token-file", tf, "k").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("token leaked to stdout with --token-file: %q", out)
+	}
+	data, err := os.ReadFile(tf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := strings.TrimSpace(string(data))
+	if len(token) != 32 {
+		t.Fatalf("token-file content: %q", token)
+	}
+	// The written token actually works.
+	if err := mutexCmd(t, state, "release", "--token", token, "k").Run(); err != nil {
+		t.Fatalf("release with token-file token: %v", err)
+	}
+}
+
+func TestRenewJSONRedactsToken(t *testing.T) {
+	state := t.TempDir()
+	out, err := mutexCmd(t, state, "acquire", "--quiet", "k").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := strings.TrimSpace(string(out))
+	got, err := mutexCmd(t, state, "renew", "--json", "--token", token, "k").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), token) {
+		t.Fatalf("renew --json leaked the token:\n%s", got)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -35,6 +36,8 @@ func cmdRun(args []string) int {
 	dir := dirFlag(fs)
 	af := registerAcquireFlags(fs)
 	onLoss := fs.String("on-lease-loss", "terminate", "if the lease is lost mid-run: 'terminate' the command (exit 14) or 'continue' it (warn only)")
+	maxHold := fs.Duration("max-hold", 0, "abort the command (exit 14) if it holds the lease longer than this — catches a wedged/hung deploy; 0 = no cap")
+	exportToken := fs.Bool("export-token", false, "export AGENTMUTEX_TOKEN to the child so it can renew/release the lease (off by default — the token is the release credential and env is readable by same-user processes)")
 	if code, done := parseFlags(fs, args); done {
 		return code
 	}
@@ -74,6 +77,10 @@ func cmdRun(args []string) int {
 		fmt.Fprintf(os.Stderr, "agentmutex: --on-lease-loss must be 'terminate' or 'continue', got %q\n", *onLoss)
 		return ExitUsage
 	}
+	if *maxHold < 0 {
+		fmt.Fprintf(os.Stderr, "agentmutex: --max-hold must be >= 0, got %s\n", *maxHold)
+		return ExitUsage
+	}
 
 	st, err := openStore(*dir)
 	if err != nil {
@@ -97,18 +104,32 @@ func cmdRun(args []string) int {
 			key, humanDur(*af.ttl), shellJoin(cmdArgs))
 	}
 
-	// Child inherits the lease so wrapped scripts can renew/release early and
-	// nested agentmutex calls can detect self-reentry instead of deadlocking.
+	// The child sees the key and store dir (for nested self-reentry detection
+	// and monitoring), but NOT the lease token by default — the token is the
+	// release credential and a build step that dumps its environment (or any
+	// same-user process reading /proc/<pid>/environ) could then release the
+	// lease. Pass --export-token to opt in.
 	childEnv := append(os.Environ(),
 		"AGENTMUTEX_LEASE_KEY="+key,
-		"AGENTMUTEX_TOKEN="+holder.Token,
 		"AGENTMUTEX_DIR="+st.Root,
 	)
+	if *exportToken {
+		childEnv = append(childEnv, "AGENTMUTEX_TOKEN="+holder.Token)
+	}
 
-	// Auto-renew at ttl/3 so even two consecutive missed renewals cannot
-	// lose the lease while the command runs. Definitive loss (someone else
-	// holds it, or no lease exists) closes leaseLost; transient errors only
-	// warn.
+	// lease holds the current token; the watchdog may rotate it when it
+	// reclaims a lease that was cleared out from under us.
+	lease := &leaseHolder{token: holder.Token}
+	reclaimOpts := mutex.AcquireOpts{
+		TTL: *af.ttl, Agent: holder.Agent, PID: holder.PID,
+		Host: holder.Host, Reason: holder.Reason, Reclaim: true,
+	}
+
+	// Auto-renew at ttl/3 so even two consecutive missed renewals cannot lose
+	// the lease while the command runs. If the lease is cleared out from
+	// under us (force-release, prune, a transient failure past the TTL), we
+	// RE-ACQUIRE it to re-establish exclusivity rather than run unprotected;
+	// only a different live holder (a genuine collision) closes leaseLost.
 	leaseLost := make(chan struct{})
 	var lostOnce sync.Once
 	stopRenew := make(chan struct{})
@@ -121,43 +142,47 @@ func cmdRun(args []string) int {
 		}
 		t := time.NewTicker(interval)
 		defer t.Stop()
-		// lastGood tracks the most recent moment the lease was provably ours.
-		// If renews keep failing (I/O error, ENOSPC, holder.json damaged)
-		// past the point our lease must have expired, the lease is gone even
-		// though we never saw an explicit NotHolder — treat that as loss too.
 		lastGood := holder.ExpiresAt
-		warnedGone := false
+		warnedReclaim := false
+		loseTo := func(err error) {
+			fmt.Fprintf(os.Stderr, "agentmutex: LEASE LOST on %s: %v\n", key, err)
+			lostOnce.Do(func() { close(leaseLost) })
+		}
 		for {
 			select {
 			case <-t.C:
-				h, err := st.Renew(key, holder.Token, *af.ttl)
+				h, err := st.Renew(key, lease.get(), *af.ttl)
 				if err == nil {
 					lastGood = h.ExpiresAt
 					continue
 				}
 				var nh *mutex.NotHolderError
 				if errors.As(err, &nh) {
-					// Someone else holds the lease now — a real collision.
-					fmt.Fprintf(os.Stderr, "agentmutex: LEASE LOST on %s: %v\n", key, err)
-					lostOnce.Do(func() { close(leaseLost) })
+					loseTo(err) // someone else holds it now
 					return
 				}
-				if errors.Is(err, mutex.ErrNotHeld) {
-					// The lease no longer exists but nobody else holds it —
-					// the wrapped command released early via its exported
-					// token, or a human force-released with no competitor.
-					// That is not a collision, so don't terminate the child.
-					// Keep polling, though: if a competitor later acquires
-					// the key, the next tick's NotHolderError will catch it.
-					if !warnedGone && !*af.quiet {
-						fmt.Fprintf(os.Stderr, "agentmutex: lease on %s is no longer held (released early?); auto-renew idle, still watching for a competing acquire\n", key)
-						warnedGone = true
+				// The lease is gone (ErrNotHeld) or a transient error hit.
+				// Try to re-establish exclusivity by reclaiming the key.
+				newTok := mutex.NewToken()
+				res, aerr := st.TryAcquire(key, newTok, reclaimOpts)
+				if aerr == nil && res.Acquired {
+					lease.set(newTok)
+					lastGood = res.Holder.ExpiresAt
+					if !warnedReclaim {
+						fmt.Fprintf(os.Stderr, "agentmutex: re-acquired %s after it was cleared mid-run (protection restored)\n", key)
+						warnedReclaim = true
 					}
 					continue
 				}
+				if res != nil && res.Holder != nil {
+					loseTo(fmt.Errorf("%s is now held by %s", key, res.Holder.Agent))
+					return
+				}
+				// Couldn't reclaim and nobody else holds it (transient error).
+				// If we are past the last provably-good expiry, exclusivity
+				// can no longer be guaranteed — treat as loss.
 				if !time.Now().Before(lastGood) {
-					fmt.Fprintf(os.Stderr, "agentmutex: LEASE LOST on %s: renewals have been failing past the TTL (%v); assuming the lease expired\n", key, err)
-					lostOnce.Do(func() { close(leaseLost) })
+					loseTo(fmt.Errorf("renewals failing past the TTL (%v)", err))
 					return
 				}
 				fmt.Fprintf(os.Stderr, "agentmutex: warning: failed to renew lease on %s: %v\n", key, err)
@@ -167,7 +192,7 @@ func cmdRun(args []string) int {
 		}
 	}()
 
-	code = runChild(cmdArgs, childEnv, sigc, leaseLost, *onLoss == "terminate", *af.quiet)
+	code, maxHoldHit := runChild(cmdArgs, childEnv, sigc, leaseLost, *onLoss == "terminate", *af.quiet, *maxHold)
 
 	close(stopRenew)
 	<-renewDone
@@ -178,12 +203,10 @@ func cmdRun(args []string) int {
 		lost = true
 	default:
 	}
-	if _, err := st.Release(key, holder.Token, false); err != nil {
+	if _, err := st.Release(key, lease.get(), false); err != nil {
 		// NotHolderError means someone else holds the lease now — a genuine
-		// collision. ErrNotHeld only means the lease is already gone (it
-		// expired, or the wrapped command released early via the exported
-		// token); since the command has already finished, that is not a
-		// collision, so don't escalate it to exit 14.
+		// collision. ErrNotHeld only means the lease is already gone; since
+		// the command has already finished, that is not a collision.
 		var nh *mutex.NotHolderError
 		if errors.As(err, &nh) {
 			lost = true
@@ -195,6 +218,10 @@ func cmdRun(args []string) int {
 		fmt.Fprintf(os.Stderr, "agentmutex: released %s\n", key)
 	}
 
+	if maxHoldHit {
+		fmt.Fprintf(os.Stderr, "agentmutex: aborted %s: the command held the lease longer than --max-hold %s (deploy appears wedged)\n", key, humanDur(*maxHold))
+		return ExitLeaseLost
+	}
 	if lost {
 		fmt.Fprintf(os.Stderr, "agentmutex: lease on %s was lost mid-run; the resource may have been mutated concurrently\n", key)
 		if *onLoss == "terminate" {
@@ -204,12 +231,23 @@ func cmdRun(args []string) int {
 	return code
 }
 
+// leaseHolder is a token that the auto-renew watchdog may rotate (on reclaim)
+// while the main goroutine still needs to release with the current value.
+type leaseHolder struct {
+	mu    sync.Mutex
+	token string
+}
+
+func (l *leaseHolder) get() string  { l.mu.Lock(); defer l.mu.Unlock(); return l.token }
+func (l *leaseHolder) set(t string) { l.mu.Lock(); l.token = t; l.mu.Unlock() }
+
 // runChild runs the command with stdio passed through, forwarding signals
-// from sigc to the child's process tree, and returns its exit code. If
-// leaseLost closes and terminateOnLoss is set, the tree gets SIGTERM, then
-// SIGKILL after a grace period — so backgrounded grandchildren cannot keep
-// mutating the resource once the lease is gone.
-func runChild(argv []string, env []string, sigc chan os.Signal, leaseLost <-chan struct{}, terminateOnLoss, quiet bool) int {
+// from sigc to the child's process tree, and returns its exit code plus
+// whether the max-hold cap fired. The tree gets SIGTERM then SIGKILL after a
+// grace period when: leaseLost closes (and terminateOnLoss), an external
+// SIGINT/SIGTERM arrives (so a signal-trapping deploy can't wedge the lease),
+// or maxHold elapses.
+func runChild(argv []string, env []string, sigc chan os.Signal, leaseLost <-chan struct{}, terminateOnLoss, quiet bool, maxHold time.Duration) (int, bool) {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -218,30 +256,59 @@ func runChild(argv []string, env []string, sigc chan os.Signal, leaseLost <-chan
 	ownGroup := setChildProcGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "agentmutex: %v\n", err)
-		return 127
+		return 127, false
 	}
 	child := childProc{cmd: cmd, ownGroup: ownGroup}
 	if terminateOnLoss && !ownGroup && !quiet {
 		fmt.Fprintf(os.Stderr, "agentmutex: note: this command is not in its own process group (interactive stdin or unsupported platform); on lease loss only the direct child is terminated, not detached grandchildren\n")
 	}
 	waitDone := make(chan struct{})
+	var maxHoldHit atomic.Bool
+
+	// killAfterGrace SIGKILLs the tree once grace elapses unless the child
+	// has already exited.
+	killAfterGrace := func() {
+		go func() {
+			select {
+			case <-time.After(leaseLossGrace):
+				killTree(child)
+			case <-waitDone:
+			}
+		}()
+	}
+
+	var maxHoldC <-chan time.Time
+	if maxHold > 0 {
+		maxHoldC = time.After(maxHold)
+	}
 	go func() {
+		escalating := false
 		for {
 			select {
 			case s := <-sigc:
 				signalTree(child, s)
+				// A deploy that traps and ignores SIGTERM must not keep run
+				// alive holding the lease: escalate to SIGKILL after a grace.
+				if !escalating && (s == os.Interrupt || s == syscall.SIGTERM) {
+					escalating = true
+					killAfterGrace()
+				}
 			case <-leaseLost:
 				leaseLost = nil // closed channel would spin this loop
-				if terminateOnLoss {
+				if terminateOnLoss && !escalating {
+					escalating = true
 					fmt.Fprintf(os.Stderr, "agentmutex: terminating command (lease lost); SIGKILL in %s\n", humanDur(leaseLossGrace))
 					signalTree(child, syscall.SIGTERM)
-					go func() {
-						select {
-						case <-time.After(leaseLossGrace):
-							killTree(child)
-						case <-waitDone:
-						}
-					}()
+					killAfterGrace()
+				}
+			case <-maxHoldC:
+				maxHoldC = nil
+				maxHoldHit.Store(true)
+				if !escalating {
+					escalating = true
+					fmt.Fprintf(os.Stderr, "agentmutex: max-hold %s exceeded; terminating command, SIGKILL in %s\n", humanDur(maxHold), humanDur(leaseLossGrace))
+					signalTree(child, syscall.SIGTERM)
+					killAfterGrace()
 				}
 			case <-waitDone:
 				return
@@ -250,6 +317,10 @@ func runChild(argv []string, env []string, sigc chan os.Signal, leaseLost <-chan
 	}()
 	err := cmd.Wait()
 	close(waitDone)
+	return childExitCode(err), maxHoldHit.Load()
+}
+
+func childExitCode(err error) int {
 	if err == nil {
 		return 0
 	}

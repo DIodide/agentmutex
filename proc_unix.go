@@ -32,7 +32,9 @@ func setChildProcGroup(cmd *exec.Cmd) bool {
 	if isTerminal(os.Stdin) {
 		return false
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	attr := &syscall.SysProcAttr{Setpgid: true}
+	applyDeathSignal(attr) // Linux: SIGKILL the child if agentmutex dies
+	cmd.SysProcAttr = attr
 	return true
 }
 

@@ -6,8 +6,50 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Two multi-agent adversarial hunts (60 + 54 items) drove the hardening. See
-[ROADMAP.md](ROADMAP.md) for the capability backlog that remains.
+Three multi-agent adversarial hunts (60 + 54 + 61 items) drove the hardening;
+the third focused on the concurrent tag-deploy use case (one staging
+environment, 5–10 min builds). See [ROADMAP.md](ROADMAP.md) for the remaining
+capability backlog.
+
+### Fixed (third pass — deploy scenario)
+
+- **`run` re-establishes protection when its lease is cleared mid-deploy.** If
+  a `force-release` or `prune` removes the lock while the wrapped command is
+  still running, `run` now re-acquires the key instead of finishing the deploy
+  unprotected; it terminates (exit 14) only on a genuine takeover by a
+  different live holder. Fixes an unprotected-deploy / double-deploy window.
+- **FIFO fairness under build load.** Waiter liveness is now PID-based on the
+  local host, so an agent CPU-starved by a co-located build keeps its queue
+  slot instead of being marked "stale" and barged by a later arrival. A
+  crashed queue head is dropped immediately (by dead PID) rather than blocking
+  live agents for the full staleness window.
+- A queued waiter no longer loses its FIFO position on a transient
+  `TryAcquire` error (e.g. a guard-acquisition timeout) — it retries in place.
+- `run` escalates an external SIGTERM/SIGINT to SIGKILL after a grace period,
+  so a signal-trapping deploy can't keep `run` alive holding the lock forever.
+- The lease token is **no longer exported to the wrapped command by default**
+  (env is readable by same-user processes); opt in with `--export-token`.
+- `renew --json` redacts the token (was printed unredacted).
+- Linux: the deploy child gets `Pdeathsig=SIGKILL`, so an OOM-killed `run`
+  doesn't orphan a still-running deploy (partial; Unix elsewhere relies on TTL).
+
+### Added (third pass — deploy scenario)
+
+- `run --max-hold DURATION`: abort a wedged/hung deploy (exit 14) instead of
+  holding the single staging lock indefinitely.
+- `acquire --token-file PATH`: write the token to a 0600 file instead of
+  stdout, keeping it out of CI logs.
+- `list`/`status` are deploy-triage-oriented: `list` shows each holder's
+  **reason** (what tag/sha is deploying) and **held-for** elapsed time in
+  place of the near-constant EXPIRES; `status` shows **held for** and renew
+  recency (distinguishing a live auto-renewing deploy from a wedged one) and
+  each waiter's reason.
+- Skills/README rewritten for the tag-deploy workflow: lock the *environment*
+  not the tag, size `--ttl` to build time, guard manual `acquire` against
+  deploying unlocked on failure, set a unique `--agent`, and the shared-store
+  (fail-open) invariant.
+
+### Fixed (second pass — regressions found by the follow-up hunt)
 
 ### Fixed (second pass — regressions found by the follow-up hunt)
 

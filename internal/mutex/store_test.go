@@ -3,11 +3,26 @@ package mutex
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
 )
+
+// pickDeadPID returns a PID that is not alive: it starts a trivial process,
+// waits for it to exit, and returns its (now-reaped) PID.
+func pickDeadPID(t *testing.T) int {
+	t.Helper()
+	c := exec.Command("sh", "-c", "exit 0")
+	if runtime.GOOS == "windows" {
+		c = exec.Command("cmd", "/c", "exit 0")
+	}
+	if err := c.Run(); err != nil {
+		t.Fatalf("spawning throwaway process: %v", err)
+	}
+	return c.Process.Pid
+}
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
@@ -286,6 +301,61 @@ func TestHolderFileIsNotWorldReadable(t *testing.T) {
 	}
 	if fi.Mode().Perm()&0o077 != 0 {
 		t.Fatalf("holder.json is group/other-accessible: %v", fi.Mode())
+	}
+}
+
+func TestLiveWaiterKeepsSlotDespiteStaleMtime(t *testing.T) {
+	// A live, same-host waiter whose heartbeat aged past WaiterStaleAfter
+	// (CPU-starved by a build) must keep its FIFO slot — not be barged by a
+	// later fresh arrival.
+	st := newTestStore(t)
+	st.WaiterStaleAfter = 50 * time.Millisecond
+	me := os.Getpid() // a definitely-alive PID on this host
+
+	first, err := st.Enqueue("deploy:staging", Waiter{ID: "w1", Agent: "first", Host: st.host, PID: me, EnqueuedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(80 * time.Millisecond) // W1's mtime ages past staleness
+	if _, err := st.Enqueue("deploy:staging", Waiter{ID: "w2", Agent: "later", Host: st.host, PID: me, EnqueuedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	// W1 is alive (our PID), so it must still be the fresh queue head.
+	ks, err := st.Status("deploy:staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshHead := ""
+	for _, w := range ks.Waiters {
+		if w.Fresh {
+			freshHead = w.ID
+			break
+		}
+	}
+	if freshHead != "w1" {
+		t.Fatalf("live-but-starved W1 lost its FIFO slot; fresh head = %q", freshHead)
+	}
+	_ = first
+}
+
+func TestDeadWaiterSkippedImmediately(t *testing.T) {
+	// A same-host waiter whose PID is gone is skipped at once, without
+	// waiting out the staleness window — so a crashed queue head can't block
+	// a live agent's takeover.
+	st := newTestStore(t)
+	st.WaiterStaleAfter = time.Hour // mtime is fresh; only PID-death matters
+	deadPID := pickDeadPID(t)
+
+	if _, err := st.Enqueue("k", Waiter{ID: "dead", Agent: "crashed", Host: st.host, PID: deadPID, EnqueuedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	ks, err := st.Status("k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ks.Waiters) != 1 || ks.Waiters[0].Fresh {
+		t.Fatalf("dead-PID waiter should be immediately not-fresh: %+v", ks.Waiters)
 	}
 }
 

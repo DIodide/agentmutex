@@ -18,25 +18,25 @@ import (
 func TestRunTerminatesProcessTreeOnLeaseLoss(t *testing.T) {
 	state := t.TempDir()
 	mark := filepath.Join(t.TempDir(), "grandchild-ran")
-	// The child sh backgrounds a grandchild that writes the marker after 4s,
+	// The child sh backgrounds a grandchild that writes the marker after 6s,
 	// then waits. If the process group is killed on lease loss, the marker
-	// never appears.
-	script := fmt.Sprintf(`( sleep 4; : > %q ) & wait`, mark)
-	cmd := mutexCmd(t, state, "run", "--quiet", "--ttl", "5s", "pg:key", "--", "sh", "-c", script)
+	// never appears. --ttl 9s → first reclaim tick ~3s, a wide window.
+	script := fmt.Sprintf(`( sleep 6; : > %q ) & wait`, mark)
+	cmd := mutexCmd(t, state, "run", "--quiet", "--ttl", "9s", "pg:key", "--", "sh", "-c", script)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan int, 1)
 	go func() { done <- exitCode(cmd.Wait()) }()
 
-	time.Sleep(1500 * time.Millisecond) // let child + grandchild start
-	// Real collision: break the lock and let a competitor take it, so the
-	// original run's renew sees a different holder (NotHolderError) and
-	// terminates — the path that must fence the whole process tree.
+	time.Sleep(1 * time.Second) // let child + grandchild start
+	// Real collision: break the lock and let a competitor take and HOLD it,
+	// so the original run's renew sees a different holder (NotHolderError)
+	// and terminates — the path that must fence the whole process tree.
 	if err := mutexCmd(t, state, "force-release", "--yes", "pg:key").Run(); err != nil {
 		t.Fatalf("force-release: %v", err)
 	}
-	if err := mutexCmd(t, state, "acquire", "--quiet", "--no-wait", "--agent", "thief", "pg:key").Run(); err != nil {
+	if err := mutexCmd(t, state, "acquire", "--quiet", "--no-wait", "--ttl", "5m", "--agent", "thief", "pg:key").Run(); err != nil {
 		t.Fatalf("competitor acquire: %v", err)
 	}
 
@@ -49,46 +49,85 @@ func TestRunTerminatesProcessTreeOnLeaseLoss(t *testing.T) {
 		cmd.Process.Kill()
 		t.Fatal("run did not exit after losing its lease to a competitor")
 	}
-	// Give the grandchild's 4s timer time to have fired had it survived.
-	time.Sleep(4 * time.Second)
+	// Give the grandchild's 6s timer time to have fired had it survived.
+	time.Sleep(6 * time.Second)
 	if _, err := os.Stat(mark); err == nil {
 		t.Fatal("grandchild survived lease-loss termination and mutated the resource")
 	}
 }
 
-// TestRunExportsLeaseToChild verifies the wrapped command can see its lease.
+// TestRunExportsLeaseToChild verifies the wrapped command sees the key and
+// store dir by default, and the token ONLY with --export-token.
 func TestRunExportsLeaseToChild(t *testing.T) {
 	state := t.TempDir()
-	out := filepath.Join(t.TempDir(), "env")
-	script := fmt.Sprintf(`printf '%%s\n%%s\n' "$AGENTMUTEX_LEASE_KEY" "$AGENTMUTEX_TOKEN" > %q`, out)
-	if err := mutexCmd(t, state, "run", "--quiet", "svc:api", "--", "sh", "-c", script).Run(); err != nil {
-		t.Fatalf("run: %v", err)
+	readEnv := func(extraFlag ...string) (key, dir, token string) {
+		out := filepath.Join(t.TempDir(), "env")
+		script := fmt.Sprintf(`printf '%%s\n%%s\n%%s\n' "$AGENTMUTEX_LEASE_KEY" "$AGENTMUTEX_DIR" "$AGENTMUTEX_TOKEN" > %q`, out)
+		args := append([]string{"run", "--quiet"}, extraFlag...)
+		args = append(args, "svc:api", "--", "sh", "-c", script)
+		if err := mutexCmd(t, state, args...).Run(); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		data, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := strings.SplitN(strings.TrimRight(string(data), "\n"), "\n", 3)
+		for len(f) < 3 {
+			f = append(f, "")
+		}
+		return f[0], f[1], f[2]
 	}
-	data, err := os.ReadFile(out)
-	if err != nil {
-		t.Fatal(err)
+	// Default: key + dir exported, token withheld.
+	key, dir, token := readEnv()
+	if key != "svc:api" || dir == "" {
+		t.Fatalf("child did not see key/dir: key=%q dir=%q", key, dir)
 	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) != 2 || lines[0] != "svc:api" || len(lines[1]) != 32 {
-		t.Fatalf("child did not see its lease: %q", data)
+	if token != "" {
+		t.Fatalf("token leaked into child env without --export-token: %q", token)
+	}
+	// With --export-token, the token is present.
+	_, _, token = readEnv("--export-token")
+	if len(token) != 32 {
+		t.Fatalf("--export-token did not export the token: %q", token)
 	}
 }
 
 // TestRunChildEarlyReleaseNotLost: a child releasing the lease early via its
-// exported token must NOT be treated as a lost lease (no exit 14, not killed).
+// exported token (--export-token) must NOT be treated as a lost lease — run
+// re-acquires the freed key, lets the child finish, and exits 0.
 func TestRunChildEarlyReleaseNotLost(t *testing.T) {
 	state := t.TempDir()
 	done := filepath.Join(t.TempDir(), "finished")
-	// Child releases immediately, then keeps working (non-critical tail) and
-	// writes the marker. run must let it finish and exit 0.
-	script := fmt.Sprintf(`"%s" release "$AGENTMUTEX_LEASE_KEY"; sleep 3; : > %q`, binPath, done)
-	cmd := mutexCmd(t, state, "run", "--quiet", "--ttl", "5s", "k", "--", "sh", "-c", script)
+	// Child releases immediately, then keeps working and writes the marker.
+	script := fmt.Sprintf(`"%s" release --token "$AGENTMUTEX_TOKEN" "$AGENTMUTEX_LEASE_KEY"; sleep 3; : > %q`, binPath, done)
+	cmd := mutexCmd(t, state, "run", "--quiet", "--export-token", "--ttl", "6s", "k", "--", "sh", "-c", script)
 	code := exitCode(cmd.Run())
 	if code != 0 {
 		t.Fatalf("early-release run exit: %d, want 0", code)
 	}
 	if _, err := os.Stat(done); err != nil {
 		t.Fatalf("child was killed after its own early release: %v", err)
+	}
+}
+
+// TestRunMaxHold: a wedged/hung deploy that outlives --max-hold is aborted
+// with exit 14, so it can't hold the single staging lock forever.
+func TestRunMaxHold(t *testing.T) {
+	state := t.TempDir()
+	cmd := mutexCmd(t, state, "run", "--quiet", "--ttl", "5s", "--max-hold", "2s", "k",
+		"--", "sh", "-c", "sleep 30")
+	start := time.Now()
+	code := exitCode(cmd.Run())
+	if code != 14 {
+		t.Fatalf("max-hold exceeded: exit %d, want 14", code)
+	}
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Fatalf("max-hold did not abort promptly: %v", elapsed)
+	}
+	// Lock is free afterwards.
+	if err := mutexCmd(t, state, "acquire", "--no-wait", "--quiet", "k").Run(); err != nil {
+		t.Fatalf("lock leaked after max-hold abort: %v", err)
 	}
 }
 

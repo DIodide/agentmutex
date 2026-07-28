@@ -73,7 +73,11 @@ func cmdRenew(args []string) int {
 		return releaseErrCode(err)
 	}
 	if *jsonOut {
-		printJSON(h)
+		// Redact the token: the renewing caller already has it, and printing
+		// it (e.g. into a CI log on every renew) would leak the credential.
+		red := *h
+		red.Token = ""
+		printJSON(&red)
 	} else {
 		fmt.Fprintf(os.Stderr, "agentmutex: renewed %s until %s (in %s)\n",
 			key, h.ExpiresAt.Format(time.RFC3339), humanDur(time.Until(h.ExpiresAt)))

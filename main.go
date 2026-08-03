@@ -51,8 +51,8 @@ Environment:
   AGENTMUTEX_DIR     State directory (default ~/.agentmutex)
   AGENTMUTEX_TOKEN   Default token for release/renew
   AGENTMUTEX_AGENT   Default agent name
-  Inside 'run', the child also sees AGENTMUTEX_LEASE_KEY and AGENTMUTEX_TOKEN
-  for the held lease (enabling early release / renew from the command).
+  Inside 'run', the child also sees AGENTMUTEX_LEASE_KEY and AGENTMUTEX_DIR
+  (self-reentry detection); add --export-token to let it renew/release too.
 
 Exit codes:
   0 success   2 usage    10 lock held    11 timed out    12 not lock holder

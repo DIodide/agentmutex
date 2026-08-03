@@ -156,10 +156,11 @@ positional arguments. Aliases: `lock`/`unlock`/`ls`.
 > fails *open*. On a shared deploy box, set `AGENTMUTEX_DIR` to one durable,
 > shared path for every agent.
 
-Inside `run`, the wrapped command inherits `AGENTMUTEX_LEASE_KEY`,
-`AGENTMUTEX_TOKEN`, and `AGENTMUTEX_DIR` for the held lease, so a script can
-renew or release early, and a nested `agentmutex acquire`/`run` on the *same*
-key fails fast with a self-deadlock message instead of blocking forever.
+Inside `run`, the wrapped command inherits `AGENTMUTEX_LEASE_KEY` and
+`AGENTMUTEX_DIR`, so a nested `agentmutex acquire`/`run` on the *same* key
+fails fast with a self-deadlock message instead of blocking forever. Add
+`--export-token` if the script should also be able to renew or release the
+lease itself.
 
 ### Exit codes
 

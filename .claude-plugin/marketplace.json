@@ -1,0 +1,17 @@
+{
+  "name": "agentmutex",
+  "description": "Marketplace for the agentmutex plugin: multi-agent semantic locking skills for Claude Code.",
+  "owner": {
+    "name": "Ibraheem Amin",
+    "url": "https://github.com/DIodide"
+  },
+  "plugins": [
+    {
+      "name": "agentmutex",
+      "source": "./",
+      "description": "Semantic lock coordination for AI agents: acquire/release TTL leases on shared resources (deploys, migrations, shared files), plus lock monitoring and stale-lock cleanup.",
+      "category": "workflow",
+      "tags": ["locking", "multi-agent", "coordination"]
+    }
+  ]
+}

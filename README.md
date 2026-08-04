@@ -31,11 +31,20 @@ That's the whole fix for the duelling-deploys problem.
 
 ## Install
 
+**Prebuilt binary** (Linux/macOS, amd64/arm64 — checksum-verified):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DIodide/agentmutex/main/install.sh | sh
+```
+
+**With Go:**
+
 ```bash
 go install github.com/DIodide/agentmutex@latest
 ```
 
-Or from source:
+Or grab an archive from the [releases page](https://github.com/DIodide/agentmutex/releases)
+(Windows `.zip` included), or build from source:
 
 ```bash
 git clone https://github.com/DIodide/agentmutex
@@ -211,26 +220,34 @@ Reading the files directly is supported (that's how you monitor). **Writing
 or deleting them directly is not** — always go through the CLI, which holds
 the guard.
 
-## Agent skills
+## Agent skills (Claude Code plugin)
 
-The [`skills/`](skills/) directory ships two [Claude Code skills](https://docs.anthropic.com/en/docs/claude-code)
-so your agents use the mutex correctly without being told twice:
+Two skills teach your agents the locking discipline without being told twice:
 
 - [`skills/agentmutex/`](skills/agentmutex/SKILL.md) — when and how to lock:
-  key naming, the pessimistic discipline (acquire → **re-read fresh state** →
-  act → release), TTL sizing, exit-code handling.
+  key naming (lock the *environment*, not the tag), TTL sizing, the
+  pessimistic discipline (acquire → **re-read fresh state** → act → release),
+  exit-code handling.
 - [`skills/agentmutex-monitoring/`](skills/agentmutex-monitoring/SKILL.md) —
   how to watch locks: `status --json`, `wait`, reading the on-disk state,
   when force-release is (and isn't) appropriate.
 
-Install them for all your projects:
+This repo is its own plugin marketplace, so in Claude Code:
+
+```bash
+claude plugin marketplace add DIodide/agentmutex
+claude plugin install agentmutex@agentmutex
+```
+
+(or `/plugin` interactively). The plugin ships only the skills — install the
+`agentmutex` binary separately (above) so it's on PATH. Prefer not to use
+plugins? Copy the skills directly:
 
 ```bash
 cp -r skills/agentmutex skills/agentmutex-monitoring ~/.claude/skills/
 ```
 
-or per-project into `.claude/skills/`. They work as-is for any agent that can
-read markdown and run shell commands.
+They work as-is for any agent that can read markdown and run shell commands.
 
 ## Scope and non-goals
 

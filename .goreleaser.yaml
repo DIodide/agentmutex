@@ -1,0 +1,73 @@
+# goreleaser v2 configuration (requires goreleaser >= 2.6 for `formats`).
+# Validate: goreleaser check
+# Local dry run (no tag needed): goreleaser release --snapshot --clean
+version: 2
+
+project_name: agentmutex
+
+builds:
+  - id: agentmutex
+    main: .
+    binary: agentmutex
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    # Overriding ldflags replaces goreleaser's default, so -s -w is repeated.
+    # {{ .Tag }} keeps the leading "v", matching the Makefile's git-describe
+    # and buildVersion()'s go-install fallback, so every install channel
+    # prints the same "agentmutex vX.Y.Z".
+    ldflags:
+      - -s -w -X main.version={{ .Tag }}
+    # Reproducible builds: binary timestamp = commit timestamp.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: default
+    formats: ["tar.gz"]
+    format_overrides:
+      - goos: windows
+        formats: ["zip"]
+    # Pinned so install.sh can construct URLs:
+    #   agentmutex_1.2.3_linux_amd64.tar.gz / agentmutex_1.2.3_windows_amd64.zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+
+release:
+  github:
+    owner: DIodide
+    name: agentmutex
+  draft: false
+  prerelease: auto
+  footer: |
+    ---
+    Curated changelog: [CHANGELOG.md](https://github.com/DIodide/agentmutex/blob/main/CHANGELOG.md)
+
+    Install:
+
+        curl -fsSL https://raw.githubusercontent.com/DIodide/agentmutex/main/install.sh | sh
+
+    or download the archive for your platform above, or:
+
+        go install github.com/DIodide/agentmutex@{{ .Tag }}

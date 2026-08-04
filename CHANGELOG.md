@@ -4,12 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] - 2026-08-04
 
 Three multi-agent adversarial hunts (60 + 54 + 61 items) drove the hardening;
 the third focused on the concurrent tag-deploy use case (one staging
 environment, 5–10 min builds). See [ROADMAP.md](ROADMAP.md) for the remaining
 capability backlog.
+
+### Added (release engineering)
+
+- Prebuilt binaries for Linux/macOS/Windows (amd64 + arm64) attached to
+  GitHub releases via goreleaser, plus an `install.sh` for one-line installs.
+- The agent skills are installable as a Claude Code **plugin**: the repo is
+  its own plugin marketplace (`claude plugin marketplace add DIodide/agentmutex`).
 
 ### Fixed (third pass — deploy scenario)
 
@@ -48,8 +55,6 @@ capability backlog.
   not the tag, size `--ttl` to build time, guard manual `acquire` against
   deploying unlocked on failure, set a unique `--agent`, and the shared-store
   (fail-open) invariant.
-
-### Fixed (second pass — regressions found by the follow-up hunt)
 
 ### Fixed (second pass — regressions found by the follow-up hunt)
 
@@ -140,3 +145,6 @@ capability backlog.
 - Claude Code skills for agent usage (`skills/agentmutex`) and monitoring
   (`skills/agentmutex-monitoring`).
 - Multi-process mutual-exclusion stress tests; CI on Linux/macOS/Windows.
+
+[0.2.0]: https://github.com/DIodide/agentmutex/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/DIodide/agentmutex/releases/tag/v0.1.0

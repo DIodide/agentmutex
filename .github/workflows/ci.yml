@@ -1,9 +1,10 @@
 name: ci
 
+# Tags are covered by release.yml (which tests before publishing); the
+# commit itself was already tested when pushed to main.
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
 
 jobs:

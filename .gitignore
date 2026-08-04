@@ -12,3 +12,6 @@ coverage.html
 .DS_Store
 .idea/
 .vscode/
+
+# Test artifacts that must never be committed (or packaged into the plugin)
+/.holder-*.tmp

@@ -100,7 +100,17 @@ func redactTokens(ks *mutex.KeyStatus) *mutex.KeyStatus {
 	return ks
 }
 
-// defaultAgent names this agent: $AGENTMUTEX_AGENT, else user@host.
+// shortHost returns the first DNS label ("mbp.dyn.example.edu" -> "mbp"), so
+// identities stay table-width friendly. The full hostname is still recorded
+// separately in the lease's Host field.
+func shortHost(h string) string {
+	if i := strings.IndexByte(h, '.'); i > 0 {
+		return h[:i]
+	}
+	return h
+}
+
+// defaultAgent names this agent: $AGENTMUTEX_AGENT, else user@shorthost.
 func defaultAgent() string {
 	if a := sanitizeMeta(os.Getenv("AGENTMUTEX_AGENT")); a != "" {
 		return a
@@ -113,7 +123,7 @@ func defaultAgent() string {
 	if err != nil || host == "" {
 		host = "localhost"
 	}
-	return name + "@" + host
+	return name + "@" + shortHost(host)
 }
 
 // errNoToken is returned by tokenOrEnv when no token is available; callers

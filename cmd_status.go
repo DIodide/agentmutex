@@ -107,18 +107,23 @@ func listLocks(st *mutex.Store, jsonOut bool) int {
 	// HELD-FOR (elapsed since acquire) beats EXPIRES here: for the golden
 	// auto-renewing `run` lease, EXPIRES is a near-constant ~TTL and tells
 	// you nothing, whereas a large HELD-FOR is exactly how you spot a stuck
-	// deploy. REASON shows what tag/sha each environment is deploying.
-	fmt.Fprintln(w, "KEY\tSTATE\tHOLDER\tHELD-FOR\tREASON\tWAITERS")
+	// deploy. Narrow columns first; REASON (free text) last so a long value
+	// can only push its own row, and truncated cells keep typical rows under
+	// ~100 columns so the table survives narrow terminals.
+	fmt.Fprintln(w, "KEY\tSTATE\tHOLDER\tHELD-FOR\tWAITERS\tREASON")
 	for _, ks := range all {
 		holder, held, reason := "-", "-", "-"
 		if ks.Holder != nil {
-			holder = ks.Holder.Agent
-			held = humanDur(now.Sub(ks.Holder.AcquiredAt))
+			holder = truncate(ks.Holder.Agent, 26)
 			if ks.State == "expired" {
-				held += " (stale)"
+				// How long it was actually held before the TTL ran out;
+				// STATE already says it's expired.
+				held = humanDur(ks.Holder.ExpiresAt.Sub(ks.Holder.AcquiredAt))
+			} else {
+				held = humanDur(now.Sub(ks.Holder.AcquiredAt))
 			}
 			if ks.Holder.Reason != "" {
-				reason = truncate(ks.Holder.Reason, 40)
+				reason = truncate(ks.Holder.Reason, 36)
 			}
 		}
 		fresh := 0
@@ -127,7 +132,7 @@ func listLocks(st *mutex.Store, jsonOut bool) int {
 				fresh++
 			}
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\n", ks.Key, ks.State, holder, held, reason, fresh)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\n", truncate(ks.Key, 28), ks.State, holder, held, fresh, reason)
 	}
 	w.Flush()
 	return ExitOK
@@ -154,9 +159,9 @@ func printKeyStatus(ks *mutex.KeyStatus) {
 	}
 	if ks.Holder != nil {
 		h := ks.Holder
-		// Agent already defaults to user@host; don't repeat the host when it
-		// is the tail of the agent name.
-		if strings.HasSuffix(h.Agent, "@"+h.Host) {
+		// Agent already defaults to user@shorthost; don't repeat the host
+		// when it is the tail of the agent name (full or short form).
+		if strings.HasSuffix(h.Agent, "@"+h.Host) || strings.HasSuffix(h.Agent, "@"+shortHost(h.Host)) {
 			fmt.Printf("holder:   %s (pid %d)\n", h.Agent, h.PID)
 		} else {
 			fmt.Printf("holder:   %s (pid %d on %s)\n", h.Agent, h.PID, h.Host)

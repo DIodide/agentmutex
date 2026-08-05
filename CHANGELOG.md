@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- `list` fits narrow terminals: the wide free-text REASON column moved last,
+  KEY/HOLDER/REASON cells are truncated with an ellipsis (~100-column worst
+  case), and an expired row shows how long the lease was actually held
+  rather than an ever-growing "(stale)" figure. The default agent identity
+  is now `user@shorthost` (first DNS label) instead of the full FQDN — the
+  full hostname is still recorded in the lease's `host` field, and agents
+  should keep using `--json` for parsing.
+
 ## [0.3.0] - 2026-08-05
 
 ### Added

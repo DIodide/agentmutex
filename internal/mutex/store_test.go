@@ -32,6 +32,8 @@ func newTestStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Windows cannot delete an open history.db during TempDir cleanup.
+	t.Cleanup(func() { st.Close() })
 	return st
 }
 

@@ -170,28 +170,48 @@ type Store struct {
 	now  func() time.Time
 	host string
 
-	histOnce sync.Once
-	hist     *history.Log
+	histMu     sync.Mutex
+	histOpened bool
+	hist       *history.Log
 }
 
 // record appends an audit event to the history database, best-effort: the
 // lock protocol never depends on it, so failures only surface as a one-line
 // stderr warning (once per process). Called outside the per-key guard.
 func (s *Store) record(e history.Event) {
-	s.histOnce.Do(func() {
+	s.histMu.Lock()
+	if !s.histOpened {
+		s.histOpened = true
 		h, err := history.Open(s.Root)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "agentmutex: warning: history disabled: %v\n", err)
-			return
+		} else {
+			s.hist = h
 		}
-		s.hist = h
-	})
-	if s.hist == nil {
+	}
+	h := s.hist
+	s.histMu.Unlock()
+	if h == nil {
 		return
 	}
-	if err := s.hist.Record(e); err != nil {
+	if err := h.Record(e); err != nil {
 		fmt.Fprintf(os.Stderr, "agentmutex: warning: could not record history event: %v\n", err)
 	}
+}
+
+// Close releases the lazily-opened history handle. The short-lived CLI can
+// rely on process exit, but tests and long-lived embedders must Close: on
+// Windows an open history.db cannot be deleted. Events recorded after Close
+// are dropped (best-effort semantics).
+func (s *Store) Close() error {
+	s.histMu.Lock()
+	defer s.histMu.Unlock()
+	if s.hist != nil {
+		err := s.hist.Close()
+		s.hist = nil
+		return err
+	}
+	return nil
 }
 
 // History opens the audit log for reading (the `history` command).

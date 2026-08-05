@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Lock history / audit trail.** Every lease state change — `acquired`,
+  `renewed`, `released`, `force-released` (with the forcing process),
+  `expired` (displaced or pruned), `reclaimed` — is appended to a SQLite
+  database at `$AGENTMUTEX_DIR/history.db`, correlated per lease by a public
+  `lease_id` (never the token). New `agentmutex history [<key>]` command
+  (alias `log`) with `--limit`, `--since`, `--all` (include renew
+  heartbeats), and `--json`. Recording is best-effort by design: a broken
+  history database warns but can never block a lock operation, and writes
+  happen outside the per-key guard.
+- Holders now carry a public `lease_id` in `holder.json` and `status --json`.
+
+### Changed
+
+- First third-party dependency: `modernc.org/sqlite` (pure Go, keeps
+  `CGO_ENABLED=0` cross-builds). Binary size grows ~3.8 → ~10.6 MB.
+
 ## [0.2.0] - 2026-08-04
 
 Three multi-agent adversarial hunts (60 + 54 + 61 items) drove the hardening;

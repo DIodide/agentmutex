@@ -11,8 +11,10 @@ make test      # full suite, including multi-process stress tests
 make lint      # go vet + gofmt check
 ```
 
-Go ≥ 1.24, no third-party dependencies — please keep it that way. The CLI
-uses only the standard library.
+Go ≥ 1.25. Dependency policy: the locking core is standard library only; the
+single third-party dependency is `modernc.org/sqlite` (pure Go, no cgo) for
+the history audit log — chosen so `CGO_ENABLED=0` cross-compilation keeps
+working. Please don't add further dependencies without discussion.
 
 ## What the tests must protect
 

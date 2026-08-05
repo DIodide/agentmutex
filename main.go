@@ -36,10 +36,11 @@ Commands:
   list                   List all known locks
   wait <key>             Block until a key is free (does not acquire)
   force-release <key>    Forcibly clear a lock (human override; requires --yes)
+  history [<key>]        Show the lock changelog (who held what, and when)
   prune                  Remove expired leases and stale queue entries
   version                Print version
 
-Aliases: lock=acquire, unlock=release, ls=list.
+Aliases: lock=acquire, unlock=release, ls=list, log=history.
 
 Keys are structured namespaces matching the resource they protect:
   deploy:staging     service:api:database     account:12345
@@ -100,6 +101,8 @@ func dispatch(cmd string, rest []string) int {
 		return cmdWait(rest)
 	case "force-release":
 		return cmdForceRelease(rest)
+	case "history", "log":
+		return cmdHistory(rest)
 	case "prune":
 		return cmdPrune(rest)
 	case "version", "--version", "-v":

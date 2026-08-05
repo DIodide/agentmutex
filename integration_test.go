@@ -533,6 +533,51 @@ func TestRenewJSONRedactsToken(t *testing.T) {
 	}
 }
 
+func TestHistoryCommand(t *testing.T) {
+	state := t.TempDir()
+	out, err := mutexCmd(t, state, "acquire", "--quiet", "--agent", "hist-a", "--reason", "deploy v9", "h:key").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := strings.TrimSpace(string(out))
+	if err := mutexCmd(t, state, "release", "--token", token, "h:key").Run(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Human table shows the lifecycle, newest first.
+	got, err := mutexCmd(t, state, "history", "h:key").Output()
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	s := string(got)
+	for _, want := range []string{"released", "acquired", "hist-a", "deploy v9"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("history output missing %q:\n%s", want, s)
+		}
+	}
+	// The secret token must never appear in history output.
+	if strings.Contains(s, token) {
+		t.Fatalf("history leaked the lease token:\n%s", s)
+	}
+
+	// JSON is valid and correlated by lease_id.
+	got, err = mutexCmd(t, state, "history", "--json", "h:key").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), `"lease_id"`) || strings.Contains(string(got), token) {
+		t.Fatalf("history --json wrong or leaking:\n%s", got)
+	}
+
+	// Usage validation.
+	if got := exitCode(mutexCmd(t, state, "history", "--limit", "0").Run()); got != 2 {
+		t.Errorf("history --limit 0: exit %d, want 2", got)
+	}
+	if got := exitCode(mutexCmd(t, state, "history", "a", "b").Run()); got != 2 {
+		t.Errorf("history with two keys: exit %d, want 2", got)
+	}
+}
+
 func TestStatusJSON(t *testing.T) {
 	state := t.TempDir()
 	if err := mutexCmd(t, state, "acquire", "--quiet", "--reason", "deploying v2", "deploy:staging").Run(); err != nil {

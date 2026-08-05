@@ -30,9 +30,8 @@ order. Contributions welcome — see CONTRIBUTING.md.
 
 ## Observability
 
-- **Event log / audit trail.** `release` deletes `holder.json`, leaving no
-  history. An append-only log of acquire/release/expire events would make
-  post-incident debugging of agent collisions possible.
+- ~~**Event log / audit trail.**~~ Done: `agentmutex history` over a SQLite
+  changelog at `<root>/history.db` (see docs/DESIGN.md).
 - **`run` timing output / `--json`.** Emit machine-readable wait duration,
   hold duration, renew count, and loss cause, so an orchestrating agent gets
   more than human stderr.

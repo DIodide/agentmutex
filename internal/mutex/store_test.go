@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/DIodide/agentmutex/internal/history"
 )
 
 // pickDeadPID returns a PID that is not alive: it starts a trivial process,
@@ -404,6 +406,68 @@ func TestStatusKeepsHolderWhenQueueUnreadable(t *testing.T) {
 	// unreadable-with-no-holder).
 	if ks.State != "held" || ks.Holder == nil || ks.Holder.Agent != "a" {
 		t.Fatalf("holder discarded on queue read error: %+v", ks)
+	}
+}
+
+func TestLifecycleIsRecordedInHistory(t *testing.T) {
+	st := newTestStore(t)
+	tok := NewToken()
+	mustAcquire(t, st, "deploy:staging", tok, AcquireOpts{TTL: time.Minute, Agent: "a", Reason: "ship v1"})
+	if _, err := st.Renew("deploy:staging", tok, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Release("deploy:staging", tok, false); err != nil {
+		t.Fatal(err)
+	}
+
+	log, err := st.History()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	events, err := log.Query(history.QueryOpts{Key: "deploy:staging", IncludeRenews: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("want acquired+renewed+released, got %d: %+v", len(events), events)
+	}
+	// Newest first: released, renewed, acquired — all correlated by lease id.
+	if events[0].Event != history.EventReleased || events[2].Event != history.EventAcquired {
+		t.Fatalf("wrong order/types: %+v", events)
+	}
+	id := events[2].LeaseID
+	if id == "" || events[0].LeaseID != id || events[1].LeaseID != id {
+		t.Fatalf("lease id does not correlate the lifecycle: %+v", events)
+	}
+	// The lease token must never appear in any history field.
+	for _, e := range events {
+		if e.LeaseID == tok || e.Detail == tok || e.Reason == tok {
+			t.Fatalf("lease token leaked into history: %+v", e)
+		}
+	}
+}
+
+func TestExpiryTakeoverRecordedInHistory(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Now()
+	st.now = func() time.Time { return now }
+	mustAcquire(t, st, "k", NewToken(), AcquireOpts{TTL: time.Second, Agent: "dead"})
+	now = now.Add(2 * time.Second)
+	mustAcquire(t, st, "k", NewToken(), AcquireOpts{TTL: time.Minute, Agent: "taker"})
+
+	log, err := st.History()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	events, err := log.Query(history.QueryOpts{Key: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Newest first: acquired(taker), expired(dead), acquired(dead).
+	if len(events) != 3 || events[0].Agent != "taker" || events[1].Event != history.EventExpired || events[1].Agent != "dead" {
+		t.Fatalf("takeover not recorded correctly: %+v", events)
 	}
 }
 

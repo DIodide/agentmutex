@@ -69,6 +69,9 @@ make build && make deploy-staging
 # Who's holding what? (list shows what each environment is deploying + for how long)
 agentmutex status deploy:staging
 agentmutex list
+
+# Who held it before? The lock changelog (also --json, --since 24h, --all):
+agentmutex history deploy:staging
 ```
 
 ## Design
@@ -144,6 +147,7 @@ per resource.
 | `list` | List all known locks. |
 | `wait <key>` | Block until a key is free. Observational — does **not** acquire. |
 | `force-release <key>` | Human override for wedged locks. Dry-run unless `--yes`. |
+| `history [<key>]` | The lock changelog: who acquired/released/lost each lease, newest first. |
 | `prune` | Remove expired leases and stale queue entries. |
 | `version` | Print version. |
 
@@ -210,11 +214,19 @@ State is plain JSON you can inspect with `cat` — see
 [docs/DESIGN.md](docs/DESIGN.md) for the full protocol:
 
 ```
-~/.agentmutex/locks/<encoded-key>/
-├── guard         # per-key flock target (empty)
-├── holder.json   # current lease: token, agent, reason, acquired_at, expires_at
-└── queue/        # FIFO waiters: <arrival-nanos>-<waiter-id>.json (mtime = heartbeat)
+~/.agentmutex/
+├── history.db    # append-only audit log (SQLite): every acquire/release/expiry
+└── locks/<encoded-key>/
+    ├── guard         # per-key flock target (empty)
+    ├── holder.json   # current lease: token, agent, reason, acquired_at, expires_at
+    └── queue/        # FIFO waiters: <arrival-nanos>-<waiter-id>.json (mtime = heartbeat)
 ```
+
+The history database is **best-effort by design**: locking never depends on
+it, so a full disk or corrupt `history.db` can degrade the changelog but can
+never block a deploy. Query it with `agentmutex history` rather than raw SQL
+(the schema may evolve), though `sqlite3 ~/.agentmutex/history.db` works for
+ad-hoc forensics.
 
 Reading the files directly is supported (that's how you monitor). **Writing
 or deleting them directly is not** — always go through the CLI, which holds

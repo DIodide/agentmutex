@@ -143,6 +143,26 @@ fair even under load.
 mutations must go through the CLI, which serializes them with a per-key
 guard. Reading is always safe.
 
+## Who held it before? (the lock changelog)
+
+`history` answers "who deployed staging last, when, and how did their lease
+end" — invaluable when you find staging in an unexpected state:
+
+```bash
+agentmutex history deploy:staging              # newest first: acquired/released/expired/force-released
+agentmutex history --since 24h                 # all keys, last day
+agentmutex history --json --limit 20 deploy:staging   # machine-readable
+agentmutex history --all deploy:staging        # include renew heartbeats (liveness forensics)
+```
+
+Reading it: a `released` event is a clean handoff; `expired` means that
+holder crashed or was SIGKILLed (their deploy may have been cut short —
+check what actually landed); `force-released` records a human override and
+which process forced it; `reclaimed` means a `run` had its lease cleared
+out from under it and re-protected itself. Events of one lease share a
+`lease_id`. History is best-effort: treat it as evidence, not as the lock's
+source of truth (that's `status`).
+
 ## Cleaning up after crashed agents
 
 Usually: do nothing. Expired leases are displaced automatically and stale

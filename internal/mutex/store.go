@@ -28,7 +28,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/DIodide/agentmutex/internal/history"
 )
 
 // Defaults. Deploy-sized critical sections run minutes, and waiting agents
@@ -73,10 +76,13 @@ func (e *CorruptError) Error() string {
 }
 
 // Holder is a lease on a semantic key. Token is omitempty so display paths
-// can redact it (the CLI blanks tokens in status/list output).
+// can redact it (the CLI blanks tokens in status/list output). LeaseID is a
+// public identifier correlating this lease's history events — never a
+// credential.
 type Holder struct {
 	Key        string     `json:"key"`
 	Token      string     `json:"token,omitempty"`
+	LeaseID    string     `json:"lease_id,omitempty"`
 	Agent      string     `json:"agent"`
 	PID        int        `json:"pid"`
 	Host       string     `json:"host"`
@@ -163,7 +169,33 @@ type Store struct {
 
 	now  func() time.Time
 	host string
+
+	histOnce sync.Once
+	hist     *history.Log
 }
+
+// record appends an audit event to the history database, best-effort: the
+// lock protocol never depends on it, so failures only surface as a one-line
+// stderr warning (once per process). Called outside the per-key guard.
+func (s *Store) record(e history.Event) {
+	s.histOnce.Do(func() {
+		h, err := history.Open(s.Root)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "agentmutex: warning: history disabled: %v\n", err)
+			return
+		}
+		s.hist = h
+	})
+	if s.hist == nil {
+		return
+	}
+	if err := s.hist.Record(e); err != nil {
+		fmt.Fprintf(os.Stderr, "agentmutex: warning: could not record history event: %v\n", err)
+	}
+}
+
+// History opens the audit log for reading (the `history` command).
+func (s *Store) History() (*history.Log, error) { return history.Open(s.Root) }
 
 // Open opens (creating if needed) the store at root. An empty root falls
 // back to $AGENTMUTEX_DIR, then ~/.agentmutex.
@@ -313,6 +345,7 @@ func (s *Store) TryAcquire(key, token string, o AcquireOpts) (*AcquireResult, er
 		o.TTL = DefaultTTL
 	}
 	res := &AcquireResult{}
+	var displaced *Holder // expired lease we displaced, for the audit log
 	err := s.withGuard(key, func(dir string) error {
 		now := s.now()
 		h, err := readHolder(dir)
@@ -337,9 +370,11 @@ func (s *Store) TryAcquire(key, token string, o AcquireOpts) (*AcquireResult, er
 				return nil
 			}
 		}
+		displaced = h // non-nil only when an expired lease is being replaced
 		nh := &Holder{
 			Key:        key,
 			Token:      token,
+			LeaseID:    NewToken(),
 			Agent:      o.Agent,
 			PID:        o.PID,
 			Host:       o.Host,
@@ -359,6 +394,26 @@ func (s *Store) TryAcquire(key, token string, o AcquireOpts) (*AcquireResult, er
 	})
 	if err != nil {
 		return nil, err
+	}
+	if res.Acquired {
+		if displaced != nil {
+			s.record(history.Event{
+				Key: key, Event: history.EventExpired,
+				LeaseID: displaced.LeaseID, Agent: displaced.Agent,
+				PID: displaced.PID, Host: displaced.Host, Reason: displaced.Reason,
+				HeldSeconds: displaced.ExpiresAt.Sub(displaced.AcquiredAt).Seconds(),
+				Detail:      "expired lease displaced by " + o.Agent,
+			})
+		}
+		ev := history.EventAcquired
+		if o.Reclaim {
+			ev = history.EventReclaimed
+		}
+		s.record(history.Event{
+			Key: key, Event: ev, LeaseID: res.Holder.LeaseID,
+			Agent: o.Agent, PID: o.PID, Host: o.Host, Reason: o.Reason,
+			TTLSeconds: o.TTL.Seconds(),
+		})
 	}
 	return res, nil
 }
@@ -401,6 +456,21 @@ func (s *Store) Release(key, token string, force bool) (*Holder, error) {
 	if err != nil {
 		return nil, err
 	}
+	ev := history.Event{Key: key, Event: history.EventReleased}
+	if force {
+		ev.Event = history.EventForceReleased
+		// The force-releaser is whoever runs this process, not the holder.
+		ev.Detail = fmt.Sprintf("forced from pid %d on %s", os.Getpid(), s.host)
+	}
+	if released != nil {
+		ev.LeaseID = released.LeaseID
+		ev.Agent = released.Agent
+		ev.PID = released.PID
+		ev.Host = released.Host
+		ev.Reason = released.Reason
+		ev.HeldSeconds = s.now().Sub(released.AcquiredAt).Seconds()
+	}
+	s.record(ev)
 	return released, nil
 }
 
@@ -438,6 +508,11 @@ func (s *Store) Renew(key, token string, ttl time.Duration) (*Holder, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.record(history.Event{
+		Key: key, Event: history.EventRenewed, LeaseID: renewed.LeaseID,
+		Agent: renewed.Agent, PID: renewed.PID, Host: renewed.Host,
+		Reason: renewed.Reason, TTLSeconds: ttl.Seconds(),
+	})
 	return renewed, nil
 }
 
@@ -685,6 +760,13 @@ func (s *Store) pruneKey(dir, key string, res *PruneResult) error {
 	if h, herr := readHolder(dir); herr == nil && h != nil && h.ExpiredAt(now) {
 		if os.Remove(filepath.Join(dir, holderFile)) == nil {
 			res.ExpiredLeases = append(res.ExpiredLeases, key)
+			s.record(history.Event{
+				Key: key, Event: history.EventExpired,
+				LeaseID: h.LeaseID, Agent: h.Agent, PID: h.PID, Host: h.Host,
+				Reason:      h.Reason,
+				HeldSeconds: h.ExpiresAt.Sub(h.AcquiredAt).Seconds(),
+				Detail:      "expired lease removed by prune",
+			})
 		}
 	}
 	// Sweep orphaned holder temp files (.holder-*.tmp) left by an interrupted

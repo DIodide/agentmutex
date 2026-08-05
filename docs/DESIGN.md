@@ -141,6 +141,27 @@ still catching real double-deploys.
 | CLI, holding the guard | Kernel releases the flock at process exit. (Windows fallback: 60s staleness reclaim.) |
 | CLI, mid-write of holder.json | The temp file is orphaned; the rename never happened, so state is unchanged. |
 
+## The audit trail (history.db)
+
+`release` deletes `holder.json`, so without an audit trail the lock's past is
+unrecoverable — bad for debugging agent collisions. Every lease state change
+is therefore appended to a SQLite database at `<root>/history.db`:
+`acquired`, `renewed`, `released`, `force-released` (with the forcing
+process), `expired` (TTL ran out — displaced by a taker or removed by prune),
+and `reclaimed` (`run` re-establishing a cleared lease). Events carry a public
+`lease_id` correlating one lease's lifecycle; the secret token is never
+stored.
+
+Two design rules keep it honest:
+
+1. **Best-effort, never load-bearing.** History writes happen *outside* the
+   per-key guard and any failure (full disk, corrupt db) degrades to a
+   one-line warning — the lock protocol's correctness never depends on the
+   audit log, and recording can't extend a critical section.
+2. **Multi-process safe.** WAL mode + a 5s busy timeout let any number of
+   concurrent CLI processes append; the driver is pure Go
+   (`modernc.org/sqlite`), preserving `CGO_ENABLED=0` cross-compilation.
+
 ## Deliberate non-features
 
 - **No reentrancy** — a second acquire of the same key by the same agent

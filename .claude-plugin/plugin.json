@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "agentmutex",
   "displayName": "agentmutex",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Semantic lock coordination for AI agents: acquire/release TTL leases on shared resources (deploys, migrations, shared files) via the agentmutex CLI, plus lock monitoring and stale-lock cleanup. Requires the agentmutex binary on PATH.",
   "author": {
     "name": "Ibraheem Amin",
